@@ -302,7 +302,6 @@ def build_smart_queries(title, artist, movie, lang, mood):
     queries.append(clean_title)
     queries.append(f"{clean_title} song")
     queries.append(f"{clean_title} official")
-    queries.append(f"{clean_title} lyrics")
 
     if artist:
         queries.append(f"{artist} songs")
@@ -324,7 +323,7 @@ def build_smart_queries(title, artist, movie, lang, mood):
     elif mood == "love":
         queries += ["romantic hindi songs", "love songs bollywood", "ishq wala song"]
     elif mood == "party":
-        queries += ["party punjabi songs", "dj remix hindi", "dance songs bollywood"]
+        queries += ["party punjabi songs", "dance songs bollywood"]
     elif mood == "wedding":
         queries += ["wedding songs hindi", "shaadi ke gane"]
     elif mood == "devotional":
@@ -335,9 +334,9 @@ def build_smart_queries(title, artist, movie, lang, mood):
         queries += ["sufi songs hindi", "qawwali hits"]
 
     if lang == "hindi":
-        queries += ["latest bollywood hits", "trending hindi songs 2025"]
+        queries += ["latest bollywood hits", "trending hindi songs"]
     elif lang == "punjabi":
-        queries += ["latest punjabi songs 2025", "punjabi hits"]
+        queries += ["latest punjabi songs", "punjabi hits"]
     elif lang == "bhojpuri":
         queries.append("bhojpuri hits")
     elif lang == "haryanvi":
@@ -378,73 +377,122 @@ def build_smart_queries(title, artist, movie, lang, mood):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def get_best_song(chat_id, queries, last_title, last_vidid, artist, movie, mood, lang):
+    """
+    Pick a cleaner autoplay recommendation.
+    Priorities:
+      - no repeats
+      - avoid remix/cover/karaoke/live/status/shorts/lyrics-only junk
+      - prefer official/topic/audio uploads
+      - prefer same artist/movie/language when relevant
+      - avoid candidates that are too similar to the just-played song
+    """
     candidates = []
-    original_words = last_title.lower().split()
+    original_norm = normalize_title(last_title)
+    original_words = [w for w in original_norm.split() if len(w) > 2]
+
+    hard_bad_words = [
+        "slowed", "reverb", "8d", "lofi", "lo-fi", "nightcore",
+        "dj remix", "remix", "mashup", "bass boosted", "sped up",
+        "cover", "karaoke", "instrumental", "acoustic cover",
+        "live performance", "live concert", "reaction", "status",
+        "whatsapp status", "shorts", "short video", "edit audio",
+        "fanmade", "fan made", "teaser", "trailer", "promo",
+        "tutorial", "how to", "dance cover", "lyrics status",
+    ]
+
+    preferred_words = [
+        "official audio", "official song", "official music video",
+        "provided to youtube", "topic", "vevo", "records", "music",
+    ]
+
+    seen_vids = set()
 
     for q in queries:
         try:
             details, vidid = await yt.track(q)
-            if not vidid:
+            if not vidid or vidid in seen_vids:
                 continue
+            seen_vids.add(vidid)
 
-            # FIX 1: Hard-skip the exact same video that just played
             if vidid == last_vidid:
                 continue
 
-            title = details.get("title", "").lower()
+            raw_title = details.get("title", "") or ""
+            title = raw_title.lower().strip()
+            norm_title = normalize_title(raw_title)
             duration = details.get("duration_min", "0:00") or "0:00"
 
-            bad_words = [
-                "slowed", "reverb", "8d", "lofi", "live", "mix", "dj remix",
-                "bass boosted", "cover", "karaoke", "instrumental", "sped up",
-            ]
-            if any(x in title for x in bad_words):
+            if any(x in title for x in hard_bad_words):
                 continue
 
-            if title.strip() == last_title.lower().strip():
+            if await is_repeat(chat_id, vidid, raw_title):
                 continue
 
+            # Don't autoplay the same song from another channel/version.
+            if original_norm and norm_title and _same_song(original_norm, norm_title):
+                continue
+
+            # Reject suspiciously tiny/long tracks for normal music autoplay.
             try:
-                mins = int(duration.split(":")[0])
-                if mins < 2 or mins > 10:
+                parts = [int(x) for x in str(duration).split(":")]
+                if len(parts) == 2:
+                    secs = parts[0] * 60 + parts[1]
+                elif len(parts) == 3:
+                    secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                else:
+                    secs = 0
+                if secs and (secs < 100 or secs > 720):
                     continue
             except Exception:
                 pass
 
             score = 0
 
-            match_count = sum(1 for w in original_words[:5] if w in title and len(w) > 3)
-            score += match_count * 15
-
+            # Same artist is useful, but should not overwhelm everything else.
             if artist and artist.lower() in title:
-                score += 50
-                if title.startswith(artist.lower()):
-                    score += 30
+                score += 55
 
+            # Same movie/album context.
             if movie and movie.lower() in title:
-                score += 45
+                score += 40
 
-            if any(x in title for x in LANG_DB.get(lang, [])):
+            # Language/context relevance.
+            lang_keys = LANG_DB.get(lang, [])
+            if lang_keys and any(x in title for x in lang_keys):
                 score += 20
 
             if mood != "normal":
                 mood_keywords = MOOD_DB.get(mood, [])
                 if any(x in title for x in mood_keywords):
-                    score += 15
+                    score += 10
 
-            # FIX 1: Hard-skip recently played songs (not just penalise)
-            # Also pass title so same song from different channels is caught
-            if await is_repeat(chat_id, vidid, details.get("title", "")):
-                continue
+            # Prefer official / topic / label-style uploads.
+            if any(x in title for x in preferred_words):
+                score += 20
 
-            score += 50  # bonus for not being a repeat (always true now)
+            # Some overlap with current title is okay, but too much means likely same track/version.
+            overlap = sum(1 for w in original_words if w in norm_title)
+            if overlap:
+                score += min(overlap * 4, 16)
+
+            # Reward normal-looking song titles.
+            if 2 <= len(norm_title.split()) <= 10:
+                score += 8
+
+            # Penalise cluttered upload titles.
+            clutter = [
+                "full video", "full song", "lyrics", "lyrical", "jukebox",
+                "playlist", "compilation", "nonstop", "medley",
+            ]
+            if any(x in title for x in clutter):
+                score -= 18
 
             candidates.append((score, vidid, details))
 
         except Exception:
             continue
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.12)
 
     candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -555,24 +603,26 @@ async def auto_play_next(
             chat_id, queries, last_title, last_vidid, artist, movie, mood, lang
         )
 
-        # Fallback chain
-        if not vidid and movie:
-            details, vidid = await yt.track(f"{movie} all songs")
-            if vidid == last_vidid:
+        # Conservative fallback chain: prefer artist/movie context, then language.
+        if not vidid and artist:
+            details, vidid = await yt.track(f"{artist} official songs")
+            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
                 vidid = None
 
-        if not vidid and artist:
-            details, vidid = await yt.track(f"{artist} hits")
-            if vidid == last_vidid:
+        if not vidid and movie:
+            details, vidid = await yt.track(f"{movie} official songs")
+            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
                 vidid = None
 
         if not vidid and lang:
-            details, vidid = await yt.track(f"{lang} trending songs")
-            if vidid == last_vidid:
+            details, vidid = await yt.track(f"popular {lang} songs")
+            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
                 vidid = None
 
         if not vidid:
-            details, vidid = await yt.track("latest bollywood hits 2025")
+            details, vidid = await yt.track("popular hindi songs")
+            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
+                vidid = None
 
         if not vidid:
             try:
