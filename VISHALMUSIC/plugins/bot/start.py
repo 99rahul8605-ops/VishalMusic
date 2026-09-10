@@ -50,6 +50,33 @@ STICKERS = [
 # 🔥 Sirf wo reactions jo Telegram 100% support karta hai
 REACTIONS = ["❤️", "🔥", "🥰", "😍", "😘", "👍", "👏", "🎉", "✨", "⭐️", "🌈", "🎵", "🎶", "💝", "💖", "💗", "💓", "💞", "💕", "💋"]
 
+async def make_privacy_safe_keyboard(client, rows):
+    """Convert privacy-sensitive user profile buttons to normal t.me URL buttons."""
+    safe_rows = []
+    for row in rows or []:
+        safe_row = []
+        for button in row:
+            target_user_id = getattr(button, "user_id", None)
+            if target_user_id:
+                try:
+                    target = await client.get_users(target_user_id)
+                    username = getattr(target, "username", None)
+                    if username:
+                        safe_row.append(
+                            InlineKeyboardButton(
+                                text=button.text,
+                                url=f"https://t.me/{username}",
+                            )
+                        )
+                except Exception:
+                    continue
+            else:
+                safe_row.append(button)
+        if safe_row:
+            safe_rows.append(safe_row)
+    return InlineKeyboardMarkup(safe_rows)
+
+
 async def delete_message_after_delay(message: Message, delay: int):
     await asyncio.sleep(delay)
     try:
@@ -250,6 +277,7 @@ async def start_gp(client, message: Message, _):
         pass
     
     out = start_panel(_)
+    safe_markup = await make_privacy_safe_keyboard(client, out)
     uptime = int(time.time() - _boot_)
     
     # Random video from START_VIDS list
@@ -313,7 +341,7 @@ async def welcome(client, message: Message):
                         message.chat.title,
                         app.mention,
                     ),
-                    reply_markup=InlineKeyboardMarkup(out),
+                    reply_markup=safe_markup,
                 )
                 await add_served_chat(message.chat.id)
                 await message.stop_propagation()
