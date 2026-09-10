@@ -235,14 +235,15 @@ async def start_pm(client, message: Message, _):
         
         # Original start.py buttons for private
         out = private_panel(_)
-        
+        safe_markup = await make_privacy_safe_keyboard(client, out)
+
         # Send start message with VIDEO
         await message.reply_video(
             video=start_video,
             caption=_["start_2"].format(message.from_user.mention, app.mention),
-            reply_markup=InlineKeyboardMarkup(out),
+            reply_markup=safe_markup,
         )
-        
+
         # Log
         if await is_on_off(2):
             username = f"@{message.from_user.username}" if message.from_user.username else "None"
