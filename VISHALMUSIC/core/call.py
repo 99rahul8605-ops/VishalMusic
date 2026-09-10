@@ -268,6 +268,9 @@ class Call:
             if not check:
                 autoplay_started = False
 
+                # IMPORTANT: do not clear active-chat state before autoplay.
+                # stream(..., autoplay_next=True) needs to see that the assistant
+                # is already active so it can switch the VC stream in-place.
                 if popped:
                     try:
                         if await is_autoplay_on(chat_id):
@@ -279,39 +282,17 @@ class Call:
                                 popped.get("title", ""),
                                 popped.get("vidid", ""),
                             )
-
-                            # auto_play_next() uses stream(), and while the assistant
-                            # is already active that function may enqueue the new song
-                            # instead of switching the actual VC stream. If a new
-                            # autoplay item is now present, switch to it immediately.
-                            if autoplay_started:
-                                new_queue = db.get(chat_id) or []
-                                if new_queue:
-                                    next_item = new_queue[0]
-                                    next_file = next_item.get("file")
-                                    next_streamtype = next_item.get("streamtype", "audio")
-                                    if next_file:
-                                        next_media = dynamic_media_stream(
-                                            path=next_file,
-                                            video=(str(next_streamtype) == "video"),
-                                        )
-                                        await client.play(chat_id, next_media)
-                                        LOGGER(__name__).info(
-                                            f"Autoplay switched immediately in {chat_id}: "
-                                            f"{next_item.get('title', 'Unknown')}"
-                                        )
-
                     except Exception as e:
                         LOGGER(__name__).warning(
-                            f"Autoplay after stream end/skip failed in {chat_id}: {e}"
+                            f"Autoplay failed for {chat_id}: {e}"
                         )
                         autoplay_started = False
 
                 if autoplay_started:
                     return
 
+                # Only leave/clear when autoplay is OFF or actually failed.
                 await _clear_(chat_id)
-
                 if chat_id in self.active_calls:
                     try:
                         await client.leave_call(chat_id)
