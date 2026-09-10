@@ -264,37 +264,48 @@ class Call:
                 loop = loop - 1
                 await set_loop(chat_id, loop)
             await auto_clean(popped)
+
+            # Queue khatam ho gayi:
+            # Autoplay ko pehle chance do. _clear_() ko autoplay se pehle call
+            # karne par active-chat/queue state wipe ho jaati thi, jiski wajah
+            # se manual skip ke baad playback band ho sakta tha.
             if not check:
-                    await _clear_(chat_id)
+                autoplay_started = False
 
-                    autoplay_started = False
-                    if popped:
-                        try:
-                            if await is_autoplay_on(chat_id):
-                                from VISHALMUSIC.utils.stream.autoplay import auto_play_next
-                                # FIX 1: Pass vidid of finished song so it gets
-                                # added to RECENT before searching — prevents
-                                # the same song from being picked again.
-                                autoplay_started = await auto_play_next(
-                                    chat_id,
-                                    popped.get("chat_id", chat_id),
-                                    popped.get("title", ""),
-                                    popped.get("vidid", ""),
-                                )
-                        except Exception:
-                            autoplay_started = False
+                if popped:
+                    try:
+                        if await is_autoplay_on(chat_id):
+                            from VISHALMUSIC.utils.stream.autoplay import auto_play_next
 
-                    if not autoplay_started:
-                        if chat_id in self.active_calls:
-                            try:
-                                await client.leave_call(chat_id)
-                            except NoActiveGroupCall:
-                                pass
-                            except Exception:
-                                pass
-                            finally:
-                                self.active_calls.discard(chat_id)
+                            autoplay_started = await auto_play_next(
+                                chat_id,
+                                popped.get("chat_id", chat_id),
+                                popped.get("title", ""),
+                                popped.get("vidid", ""),
+                            )
+                    except Exception as e:
+                        LOGGER(__name__).warning(
+                            f"Autoplay after stream end/skip failed in {chat_id}: {e}"
+                        )
+                        autoplay_started = False
+
+                # Autoplay ne next track start kar diya to VC/state ko clear mat karo.
+                if autoplay_started:
                     return
+
+                # Autoplay OFF/failed: ab normal cleanup + leave.
+                await _clear_(chat_id)
+
+                if chat_id in self.active_calls:
+                    try:
+                        await client.leave_call(chat_id)
+                    except NoActiveGroupCall:
+                        pass
+                    except Exception:
+                        pass
+                    finally:
+                        self.active_calls.discard(chat_id)
+                return
         except:
             try:
                 await _clear_(chat_id)
