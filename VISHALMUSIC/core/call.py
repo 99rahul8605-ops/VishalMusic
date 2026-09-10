@@ -122,6 +122,12 @@ class Call:
 
 
     @capture_internal_err
+    async def prepare_autoplay(self, chat_id: int) -> None:
+        # Restore the old reliable playback path without leaving the VC:
+        # clear queue/active-chat bookkeeping so stream.py uses join_call().
+        await _clear_(chat_id)
+
+    @capture_internal_err
     async def force_stop_stream(self, chat_id: int) -> None:
         assistant = await group_assistant(self, chat_id)
         try:
@@ -268,13 +274,15 @@ class Call:
             if not check:
                 autoplay_started = False
 
-                # IMPORTANT: do not clear active-chat state before autoplay.
-                # stream(..., autoplay_next=True) needs to see that the assistant
-                # is already active so it can switch the VC stream in-place.
                 if popped:
                     try:
                         if await is_autoplay_on(chat_id):
                             from VISHALMUSIC.utils.stream.autoplay import auto_play_next
+
+                            # Old reliable logic:
+                            # reset logical playback state first, but do NOT leave VC.
+                            # stream.py will then use join_call() for the next song.
+                            await self.prepare_autoplay(chat_id)
 
                             autoplay_started = await auto_play_next(
                                 chat_id,
@@ -291,7 +299,6 @@ class Call:
                 if autoplay_started:
                     return
 
-                # Only leave/clear when autoplay is OFF or actually failed.
                 await _clear_(chat_id)
                 if chat_id in self.active_calls:
                     try:

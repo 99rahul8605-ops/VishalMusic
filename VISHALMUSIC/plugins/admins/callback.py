@@ -235,6 +235,8 @@ async def handle_skip_replay(callback: CallbackQuery, _, chat_id: int, command: 
                     if await is_autoplay_on(chat_id):
                         from VISHALMUSIC.utils.stream.autoplay import auto_play_next
 
+                        await VISHAL.prepare_autoplay(chat_id)
+
                         autoplay_started = await auto_play_next(
                             chat_id,
                             popped.get("chat_id", callback.message.chat.id),
@@ -257,6 +259,8 @@ async def handle_skip_replay(callback: CallbackQuery, _, chat_id: int, command: 
                 try:
                     if await is_autoplay_on(chat_id):
                         from VISHALMUSIC.utils.stream.autoplay import auto_play_next
+
+                        await VISHAL.prepare_autoplay(chat_id)
 
                         autoplay_started = await auto_play_next(
                             chat_id,

@@ -718,7 +718,6 @@ async def auto_play_next(
             original_chat_id,
             video=False,
             streamtype="youtube",
-            autoplay_next=True,
         )
 
         try:
