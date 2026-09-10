@@ -32,12 +32,13 @@ _formats_cache: Dict[str, Tuple[float, List[Dict], str]] = {}
 _formats_lock = asyncio.Lock()
 
 # ============ API CONFIGURATION ============
-SHRUTI_API_KEY = "ShrutiBotspCO4qB3gMS2eDCpMeClO"
+# Custom fast API from .env
+FAST_API_URL = os.getenv("API_URL", "").strip().rstrip("/")
+FAST_API_KEY = os.getenv("API_KEY", "").strip()
 
-# API 1: Primary Shruti API (Direct Download)
+# Existing Shruti API remains as fallback
+SHRUTI_API_KEY = "ShrutiBotspCO4qB3gMS2eDCpMeClO"
 PRIMARY_API_URL = "https://api.shrutibots.site"
-# Endpoint: /download?url={video_id}&type=audio&api_key={KEY}
-# Response: Direct file download
 
 # API 2: Legacy/Fallback API (Token Based)
 FALLBACK_API_URL = ""
@@ -57,6 +58,22 @@ async def load_apis():
     """Load and verify both APIs"""
     global PRIMARY_API_LOADED, FALLBACK_API_LOADED
     logger = LOGGER("VISHALMUSIC.platforms.Youtube.py")
+
+    if FAST_API_URL:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{FAST_API_URL}/",
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status == 200:
+                        logger.info(f"✅ FAST API loaded successfully: {FAST_API_URL}")
+                    else:
+                        logger.warning(f"⚠️ Fast API responded with status {response.status}")
+        except Exception as e:
+            logger.warning(f"⚠️ Fast API not accessible: {e}")
+    else:
+        logger.warning("⚠️ API_URL is not set; Fast API disabled.")
     
     # Check Primary API
     try:
@@ -127,6 +144,80 @@ def _check_rate_limit():
         time.sleep(sleep_time)
         _request_timestamps = []
     _request_timestamps.append(now)
+
+# ============ CUSTOM FAST API (PRIMARY AUDIO) ============
+async def download_song_fast_api(link: str) -> Optional[str]:
+    """Get best-audio URL from custom API, then download it locally."""
+    if not FAST_API_URL:
+        return None
+
+    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
+    if "youtu.be/" in video_id:
+        video_id = video_id.split("youtu.be/")[-1].split("?")[0]
+    video_id = video_id.strip()
+
+    if not video_id or len(video_id) < 3:
+        return None
+
+    try:
+        print(f"⚡ Audio - Trying Fast API: {FAST_API_URL}")
+        timeout = aiohttp.ClientTimeout(total=120)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
+
+            async with session.get(
+                f"{FAST_API_URL}/song/{video_id}",
+                params=params,
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    print(f"⚠️ Fast API returned {response.status}: {body[:250]}")
+                    return None
+                data = await response.json(content_type=None)
+
+            if data.get("status") != "done":
+                print(f"⚠️ Fast API extraction failed: {data.get('message', 'unknown error')}")
+                return None
+
+            stream_url = data.get("link")
+            if not stream_url:
+                print("⚠️ Fast API returned no audio link")
+                return None
+
+            ext = str(data.get("format") or "webm").lower()
+            if ext not in {"webm", "m4a", "mp3", "opus", "ogg"}:
+                ext = "webm"
+
+            os.makedirs("downloads", exist_ok=True)
+            file_path = os.path.join("downloads", f"{video_id}.{ext}")
+
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
+                return file_path
+
+            async with session.get(stream_url, allow_redirects=True) as media:
+                if media.status not in (200, 206):
+                    print(f"⚠️ Fast API media URL returned status {media.status}")
+                    with contextlib.suppress(Exception):
+                        os.remove(file_path)
+                    return None
+
+                with open(file_path, "wb") as f:
+                    async for chunk in media.content.iter_chunked(262144):
+                        f.write(chunk)
+
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
+                print("✅ Audio downloaded via Fast API")
+                return file_path
+
+            with contextlib.suppress(Exception):
+                os.remove(file_path)
+            return None
+
+    except Exception as e:
+        print(f"❌ Fast API error: {e}")
+        return None
+
 
 # ============ API 1: PRIMARY SHRUTI API (DIRECT DOWNLOAD) ============
 async def download_song_primary_api(link: str) -> str:
@@ -485,24 +576,30 @@ async def download_audio_ytdlp(link: str) -> str:
 # ============ MAIN DOWNLOAD FUNCTIONS (API1 -> API2 -> YTDLP) ============
 async def download_audio(link: str) -> str:
     """
-    Main audio download - Primary API -> Fallback API -> yt-dlp
+    Main audio download - Fast API -> Shruti API -> Legacy API -> yt-dlp
     """
-    # 1. TRY PRIMARY API FIRST
-    print("🎵 Audio Download - Trying Primary API (Direct)...")
+    # 1. TRY CUSTOM FAST API FIRST
+    result = await download_song_fast_api(link)
+    if result:
+        print("✅ Audio: Fast API Success")
+        return result
+
+    # 2. TRY EXISTING SHRUTI API
+    print("🔄 Audio - Fast API failed, trying Shruti API...")
     result = await download_song_primary_api(link)
     if result:
-        print("✅ Audio: Primary API Success")
+        print("✅ Audio: Shruti API Success")
         return result
-    
-    # 2. TRY FALLBACK API (TOKEN BASED)
-    print("🔄 Audio - Primary failed, trying Fallback API (Token)...")
+
+    # 3. TRY LEGACY/TOKEN API
+    print("🔄 Audio - Shruti failed, trying Legacy API...")
     result = await download_song_fallback_api(link)
     if result:
-        print("✅ Audio: Fallback API Success")
+        print("✅ Audio: Legacy API Success")
         return result
-    
-    # 3. TRY YT-DLP AS LAST RESORT
-    print("🔄 Audio - Both APIs failed, trying yt-dlp fallback...")
+
+    # 4. TRY LOCAL YT-DLP AS LAST RESORT
+    print("🔄 Audio - APIs failed, trying yt-dlp fallback...")
     result = await download_audio_ytdlp(link)
     if result:
         print("✅ Audio: yt-dlp Success")
