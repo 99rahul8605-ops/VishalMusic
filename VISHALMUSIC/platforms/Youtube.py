@@ -194,7 +194,7 @@ async def get_fast_audio_stream(link: str) -> Optional[str]:
 
 # ============ CUSTOM FAST API (PRIMARY AUDIO) ============
 async def download_song_fast_api(link: str) -> Optional[str]:
-    """Use the custom API for extraction, then save the audio locally for stable VC playback."""
+    """Get best-audio URL from custom API, then download it locally."""
     if not FAST_API_URL:
         return None
 
@@ -206,93 +206,63 @@ async def download_song_fast_api(link: str) -> Optional[str]:
     if not video_id or len(video_id) < 3:
         return None
 
-    os.makedirs("downloads", exist_ok=True)
-
     try:
-        print(f"⚡ Audio - Fast API extracting: {FAST_API_URL}")
+        print(f"⚡ Audio - Trying Fast API: {FAST_API_URL}")
+        timeout = aiohttp.ClientTimeout(total=120)
 
-        api_timeout = aiohttp.ClientTimeout(total=35, connect=10, sock_read=30)
-        params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
 
-        async with aiohttp.ClientSession(timeout=api_timeout) as session:
             async with session.get(
                 f"{FAST_API_URL}/song/{video_id}",
                 params=params,
             ) as response:
                 if response.status != 200:
                     body = await response.text()
-                    print(f"⚠️ Fast API returned {response.status}: {body[:200]}")
+                    print(f"⚠️ Fast API returned {response.status}: {body[:250]}")
                     return None
                 data = await response.json(content_type=None)
 
-        if data.get("status") != "done":
-            print(f"⚠️ Fast API extraction failed: {data.get('message', 'unknown error')}")
-            return None
+            if data.get("status") != "done":
+                print(f"⚠️ Fast API extraction failed: {data.get('message', 'unknown error')}")
+                return None
 
-        stream_url = data.get("link")
-        if not stream_url or not stream_url.startswith("http"):
-            print("⚠️ Fast API returned no valid audio URL")
-            return None
+            stream_url = data.get("link")
+            if not stream_url:
+                print("⚠️ Fast API returned no audio link")
+                return None
 
-        ext = str(data.get("format") or "m4a").lower().strip(".")
-        if ext not in {"m4a", "webm", "mp3", "opus", "ogg"}:
-            ext = "m4a"
+            ext = str(data.get("format") or "webm").lower()
+            if ext not in {"webm", "m4a", "mp3", "opus", "ogg"}:
+                ext = "webm"
 
-        file_path = os.path.join("downloads", f"{video_id}.{ext}")
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
-            print("✅ Fast API local cache")
-            return file_path
+            os.makedirs("downloads", exist_ok=True)
+            file_path = os.path.join("downloads", f"{video_id}.{ext}")
 
-        # Media request: use browser-like headers because some signed YouTube URLs
-        # are unreliable when fetched with aiohttp defaults.
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-            "Referer": "https://www.youtube.com/",
-            "Connection": "keep-alive",
-        }
-        media_timeout = aiohttp.ClientTimeout(
-            total=300,
-            connect=15,
-            sock_connect=15,
-            sock_read=60,
-        )
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
+                return file_path
 
-        tmp_path = file_path + ".part"
-        with contextlib.suppress(Exception):
-            os.remove(tmp_path)
-
-        async with aiohttp.ClientSession(
-            timeout=media_timeout,
-            headers=headers,
-        ) as session:
-            async with session.get(
-                stream_url,
-                allow_redirects=True,
-            ) as media:
+            async with session.get(stream_url, allow_redirects=True) as media:
                 if media.status not in (200, 206):
-                    print(f"⚠️ Fast API media returned status {media.status}")
+                    print(f"⚠️ Fast API media URL returned status {media.status}")
+                    with contextlib.suppress(Exception):
+                        os.remove(file_path)
                     return None
 
-                with open(tmp_path, "wb") as f:
-                    async for chunk in media.content.iter_chunked(512 * 1024):
-                        if chunk:
-                            f.write(chunk)
+                with open(file_path, "wb") as f:
+                    async for chunk in media.content.iter_chunked(262144):
+                        f.write(chunk)
 
-        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 10240:
-            os.replace(tmp_path, file_path)
-            print(f"✅ Audio ready via Fast API: {file_path}")
-            return file_path
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
+                print("✅ Audio downloaded via Fast API")
+                return file_path
 
-        with contextlib.suppress(Exception):
-            os.remove(tmp_path)
-        return None
+            with contextlib.suppress(Exception):
+                os.remove(file_path)
+            return None
 
-    except asyncio.TimeoutError:
-        print("❌ Fast API audio timeout")
-        return None
     except Exception as e:
-        print(f"❌ Fast API audio error: {type(e).__name__}: {e}")
+        print(f"❌ Fast API error: {e}")
         return None
 
 
@@ -653,23 +623,44 @@ async def download_audio_ytdlp(link: str) -> str:
 # ============ MAIN DOWNLOAD FUNCTIONS (API1 -> API2 -> YTDLP) ============
 async def download_audio(link: str) -> str:
     """
-    Stable audio path:
-    Fast API extraction + local media file -> original local yt-dlp fallback.
+    Main audio download - Fast API -> Shruti API -> Legacy API -> yt-dlp
     """
+    # 1. TRY CUSTOM FAST API FIRST
     result = await download_song_fast_api(link)
     if result:
         print("✅ Audio: Fast API Success")
         return result
 
-    print("🔄 Fast API failed, trying local yt-dlp fallback...")
+    # 2. TRY EXISTING SHRUTI API
+    print("🔄 Audio - Fast API failed, trying Shruti API...")
+    result = await download_song_primary_api(link)
+    if result:
+        print("✅ Audio: Shruti API Success")
+        return result
+
+    # 3. TRY LEGACY/TOKEN API
+    print("🔄 Audio - Shruti failed, trying Legacy API...")
+    result = await download_song_fallback_api(link)
+    if result:
+        print("✅ Audio: Legacy API Success")
+        return result
+
+    # 4. TRY LOCAL YT-DLP AS LAST RESORT
+    print("🔄 Audio - APIs failed, trying yt-dlp fallback...")
     result = await download_audio_ytdlp(link)
     if result:
         print("✅ Audio: yt-dlp Success")
+        if result.endswith('.webm'):
+            mp3_path = result.replace('.webm', '.mp3')
+            try:
+                shutil.move(result, mp3_path)
+                return mp3_path
+            except:
+                return result
         return result
-
-    print("❌ Fast API and yt-dlp audio methods failed")
+    
+    print("❌ All audio download methods failed")
     return None
-
 
 
 async def download_video(link: str) -> str:
@@ -1085,7 +1076,16 @@ class YouTubeAPI:
                 return None, None
 
         else:
-            # Stable audio path: return a real local audio file to the existing VC pipeline.
+            # Fastest path for VC playback: use the signed direct audio URL.
+            try:
+                stream_url = await get_fast_audio_stream(link)
+                if stream_url:
+                    print("✅ Audio: direct Fast API stream")
+                    return stream_url, None
+            except Exception as e:
+                print(f"❌ Fast API direct stream error: {str(e)}")
+
+            # Fallbacks below download the media locally.
             try:
                 audio_result = await download_audio(link)
                 if audio_result:
