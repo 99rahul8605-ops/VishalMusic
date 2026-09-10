@@ -145,6 +145,53 @@ def _check_rate_limit():
         _request_timestamps = []
     _request_timestamps.append(now)
 
+# ============ CUSTOM FAST API DIRECT STREAM ============
+async def get_fast_audio_stream(link: str) -> Optional[str]:
+    """Return the signed direct audio URL without downloading the media locally."""
+    if not FAST_API_URL:
+        return None
+
+    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
+    if "youtu.be/" in video_id:
+        video_id = video_id.split("youtu.be/")[-1].split("?")[0]
+    video_id = video_id.strip()
+
+    if not video_id or len(video_id) < 3:
+        return None
+
+    try:
+        print(f"⚡ Audio - Getting direct stream from Fast API: {FAST_API_URL}")
+        timeout = aiohttp.ClientTimeout(total=30)
+        params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{FAST_API_URL}/song/{video_id}",
+                params=params,
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    print(f"⚠️ Fast API returned {response.status}: {body[:250]}")
+                    return None
+
+                data = await response.json(content_type=None)
+
+        if data.get("status") != "done":
+            print(f"⚠️ Fast API extraction failed: {data.get('message', 'unknown error')}")
+            return None
+
+        stream_url = data.get("link")
+        if stream_url and stream_url.startswith("http"):
+            print("✅ Fast API direct audio stream ready")
+            return stream_url
+
+        print("⚠️ Fast API returned no valid stream URL")
+        return None
+    except Exception as e:
+        print(f"❌ Fast API stream error: {e}")
+        return None
+
+
 # ============ CUSTOM FAST API (PRIMARY AUDIO) ============
 async def download_song_fast_api(link: str) -> Optional[str]:
     """Get best-audio URL from custom API, then download it locally."""
@@ -650,6 +697,7 @@ async def download_video(link: str) -> str:
 async def cached_youtube_search(query: str) -> List[Dict]:
     key = f"q:{query}"
     now = time.time()
+
     async with _cache_lock:
         if key in _cache:
             ts, val = _cache[key]
@@ -658,14 +706,72 @@ async def cached_youtube_search(query: str) -> List[Dict]:
             _cache.pop(key, None)
         if len(_cache) > YOUTUBE_META_MAX:
             _cache.clear()
-    try:
-        data = await VideosSearch(query, limit=1).next()
-        result = data.get("result", [])
-    except Exception:
-        result = []
+
+    result: List[Dict] = []
+
+    # 1) Fast API search by song name
+    if FAST_API_URL:
+        try:
+            params = {
+                "q": query,
+                "limit": 1,
+            }
+            if FAST_API_KEY:
+                params["api_key"] = FAST_API_KEY
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as session:
+                async with session.get(
+                    f"{FAST_API_URL}/search",
+                    params=params,
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json(content_type=None)
+                        api_results = data.get("results", [])
+
+                        for item in api_results:
+                            video_id = item.get("id") or item.get("video_id") or ""
+                            title = item.get("title", "")
+                            duration = item.get("duration")
+                            thumbnail = item.get("thumbnail") or ""
+                            channel = item.get("channel") or item.get("uploader") or ""
+
+                            # Normalize to the structure expected by the existing bot
+                            result.append({
+                                "id": video_id,
+                                "title": title,
+                                "duration": duration,
+                                "thumbnail": thumbnail,
+                                "thumbnails": [{"url": thumbnail}] if thumbnail else [],
+                                "channel": channel,
+                                "webpage_url": (
+                                    f"https://www.youtube.com/watch?v={video_id}"
+                                    if video_id else ""
+                                ),
+                            })
+
+                        if result:
+                            print(f"✅ Search via Fast API: {query}")
+                    else:
+                        print(f"⚠️ Fast API search returned status {response.status}")
+        except Exception as e:
+            print(f"⚠️ Fast API search failed: {e}")
+
+    # 2) Existing py_yt search as fallback
+    if not result:
+        try:
+            data = await VideosSearch(query, limit=1).next()
+            result = data.get("result", [])
+            if result:
+                print(f"✅ Search via py_yt fallback: {query}")
+        except Exception:
+            result = []
+
     if result:
         async with _cache_lock:
             _cache[key] = (now, result)
+
     return result
 
 async def shell_cmd(cmd):
@@ -970,6 +1076,16 @@ class YouTubeAPI:
                 return None, None
 
         else:
+            # Fastest path for VC playback: use the signed direct audio URL.
+            try:
+                stream_url = await get_fast_audio_stream(link)
+                if stream_url:
+                    print("✅ Audio: direct Fast API stream")
+                    return stream_url, None
+            except Exception as e:
+                print(f"❌ Fast API direct stream error: {str(e)}")
+
+            # Fallbacks below download the media locally.
             try:
                 audio_result = await download_audio(link)
                 if audio_result:
