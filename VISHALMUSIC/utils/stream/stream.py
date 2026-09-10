@@ -31,6 +31,7 @@ async def stream(
     streamtype: Union[bool, str] = None,
     spotify: Union[bool, str] = None,
     forceplay: Union[bool, str] = None,
+    autoplay_next: Union[bool, str] = None,
 ) -> None:
     if not result:
         return
@@ -162,7 +163,10 @@ async def stream(
         if not file_path:
             raise AssistantErr(_["play_14"])
 
-        if await is_active_chat(chat_id):
+        active = await is_active_chat(chat_id)
+
+        # Normal user request while something is already playing -> queue it.
+        if active and not bool(autoplay_next):
             await put_queue(
                 chat_id,
                 original_chat_id,
@@ -181,16 +185,30 @@ async def stream(
                 text=_["queue_4"].format(position, title[:27], duration_min, user_name),
                 reply_markup=InlineKeyboardMarkup(button),
             )
+
+        # Autoplay is different: the previous stream has already ended, so if
+        # the assistant is still in VC we must SWITCH the stream immediately,
+        # not put the song into queue and wait for another StreamEnded event.
         else:
-            if not forceplay:
-                db[chat_id] = []
-            await VISHAL.join_call(
-                chat_id,
-                original_chat_id,
-                file_path,
-                video=is_video,
-                image=thumbnail,
-            )
+            if not active:
+                if not forceplay:
+                    db[chat_id] = []
+                await VISHAL.join_call(
+                    chat_id,
+                    original_chat_id,
+                    file_path,
+                    video=is_video,
+                    image=thumbnail,
+                )
+            else:
+                # Keep assistant in the same VC and replace the ended stream.
+                await VISHAL.skip_stream(
+                    chat_id,
+                    file_path,
+                    video=is_video,
+                    image=thumbnail,
+                )
+
             await put_queue(
                 chat_id,
                 original_chat_id,
@@ -203,6 +221,7 @@ async def stream(
                 "video" if is_video else "audio",
                 forceplay=forceplay,
             )
+
             img = await get_thumb(vidid)
             ap_status = await is_autoplay_on(chat_id)
             button = stream_markup(_, chat_id, autoplay_status=ap_status)
