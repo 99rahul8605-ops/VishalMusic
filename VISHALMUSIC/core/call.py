@@ -265,10 +265,6 @@ class Call:
                 await set_loop(chat_id, loop)
             await auto_clean(popped)
 
-            # Queue khatam ho gayi:
-            # Autoplay ko pehle chance do. _clear_() ko autoplay se pehle call
-            # karne par active-chat/queue state wipe ho jaati thi, jiski wajah
-            # se manual skip ke baad playback band ho sakta tha.
             if not check:
                 autoplay_started = False
 
@@ -283,17 +279,37 @@ class Call:
                                 popped.get("title", ""),
                                 popped.get("vidid", ""),
                             )
+
+                            # auto_play_next() uses stream(), and while the assistant
+                            # is already active that function may enqueue the new song
+                            # instead of switching the actual VC stream. If a new
+                            # autoplay item is now present, switch to it immediately.
+                            if autoplay_started:
+                                new_queue = db.get(chat_id) or []
+                                if new_queue:
+                                    next_item = new_queue[0]
+                                    next_file = next_item.get("file")
+                                    next_streamtype = next_item.get("streamtype", "audio")
+                                    if next_file:
+                                        next_media = dynamic_media_stream(
+                                            path=next_file,
+                                            video=(str(next_streamtype) == "video"),
+                                        )
+                                        await client.play(chat_id, next_media)
+                                        LOGGER(__name__).info(
+                                            f"Autoplay switched immediately in {chat_id}: "
+                                            f"{next_item.get('title', 'Unknown')}"
+                                        )
+
                     except Exception as e:
                         LOGGER(__name__).warning(
                             f"Autoplay after stream end/skip failed in {chat_id}: {e}"
                         )
                         autoplay_started = False
 
-                # Autoplay ne next track start kar diya to VC/state ko clear mat karo.
                 if autoplay_started:
                     return
 
-                # Autoplay OFF/failed: ab normal cleanup + leave.
                 await _clear_(chat_id)
 
                 if chat_id in self.active_calls:
