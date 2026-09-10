@@ -227,6 +227,25 @@ async def handle_skip_replay(callback: CallbackQuery, _, chat_id: int, command: 
                 await auto_clean(popped)
             if not playlist:
                 await callback.edit_message_text(text_msg)
+
+                # Queue empty after manual skip:
+                # if autoplay is ON, start the next autoplay track instead of
+                # stopping the VC and showing "no more queued tracks".
+                try:
+                    if await is_autoplay_on(chat_id):
+                        from VISHALMUSIC.utils.stream.autoplay import auto_play_next
+
+                        autoplay_started = await auto_play_next(
+                            chat_id,
+                            popped.get("chat_id", callback.message.chat.id),
+                            popped.get("title", ""),
+                            popped.get("vidid", ""),
+                        )
+                        if autoplay_started:
+                            return
+                except Exception:
+                    pass
+
                 await callback.message.reply_text(
                     _["admin_6"].format(user_mention, callback.message.chat.title),
                     reply_markup=close_markup(_)
@@ -235,6 +254,21 @@ async def handle_skip_replay(callback: CallbackQuery, _, chat_id: int, command: 
         except Exception:
             try:
                 await callback.edit_message_text(text_msg)
+                try:
+                    if await is_autoplay_on(chat_id):
+                        from VISHALMUSIC.utils.stream.autoplay import auto_play_next
+
+                        autoplay_started = await auto_play_next(
+                            chat_id,
+                            callback.message.chat.id,
+                            "",
+                            "",
+                        )
+                        if autoplay_started:
+                            return
+                except Exception:
+                    pass
+
                 await callback.message.reply_text(
                     _["admin_6"].format(user_mention, callback.message.chat.title),
                     reply_markup=close_markup(_)

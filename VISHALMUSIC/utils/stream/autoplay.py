@@ -603,26 +603,75 @@ async def auto_play_next(
             chat_id, queries, last_title, last_vidid, artist, movie, mood, lang
         )
 
-        # Conservative fallback chain: prefer artist/movie context, then language.
-        if not vidid and artist:
-            details, vidid = await yt.track(f"{artist} official songs")
-            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
-                vidid = None
-
-        if not vidid and movie:
-            details, vidid = await yt.track(f"{movie} official songs")
-            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
-                vidid = None
-
-        if not vidid and lang:
-            details, vidid = await yt.track(f"popular {lang} songs")
-            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
-                vidid = None
-
+        # Robust fallback chain.
+        # yt.track(query) returns only one top result, so try several varied
+        # searches. This avoids autoplay dying when the first result is the
+        # same/recent song.
         if not vidid:
-            details, vidid = await yt.track("popular hindi songs")
-            if vidid == last_vidid or await is_repeat(chat_id, vidid, details.get("title", "") if details else ""):
-                vidid = None
+            fallback_queries = []
+
+            if artist:
+                fallback_queries += [
+                    f"{artist} popular songs",
+                    f"{artist} best songs",
+                    f"{artist} hits",
+                    f"{artist} top songs",
+                ]
+
+            if movie:
+                fallback_queries += [
+                    f"{movie} songs",
+                    f"{movie} soundtrack",
+                    f"{movie} popular songs",
+                ]
+
+            if mood and mood != "normal":
+                fallback_queries += [
+                    f"{mood} {lang} songs",
+                    f"popular {mood} songs",
+                ]
+
+            if lang:
+                fallback_queries += [
+                    f"popular {lang} songs",
+                    f"{lang} hits",
+                    f"top {lang} songs",
+                    f"trending {lang} songs",
+                ]
+
+            fallback_queries += [
+                "popular hindi songs",
+                "bollywood hits",
+                "trending indian songs",
+                "top indian songs",
+            ]
+
+            fallback_bad = [
+                "slowed", "reverb", "8d", "lofi", "lo-fi", "nightcore",
+                "dj remix", "remix", "mashup", "bass boosted", "sped up",
+                "cover", "karaoke", "instrumental", "reaction", "status",
+                "whatsapp status", "shorts", "fanmade", "fan made",
+            ]
+
+            for fq in fallback_queries:
+                try:
+                    cand_details, cand_vidid = await yt.track(fq)
+                    if not cand_vidid or cand_vidid == last_vidid:
+                        continue
+
+                    cand_title = (cand_details or {}).get("title", "")
+                    cand_title_lower = cand_title.lower()
+
+                    if any(x in cand_title_lower for x in fallback_bad):
+                        continue
+
+                    if await is_repeat(chat_id, cand_vidid, cand_title):
+                        continue
+
+                    details, vidid = cand_details, cand_vidid
+                    break
+                except Exception:
+                    continue
 
         if not vidid:
             try:
