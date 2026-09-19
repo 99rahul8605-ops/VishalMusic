@@ -2,6 +2,7 @@ import os
 import random
 import asyncio
 from collections import deque
+from datetime import datetime, timezone
 from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import Message, ChatMemberUpdated
@@ -14,19 +15,21 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 LOGGER_ID = int(os.getenv("LOGGER_ID", 0))
 OWNER_ID = int(os.getenv("OWNER_ID", 0))
 REPLY_PROB = float(os.getenv("REPLY_PROB", 0.71))  # 0.0 - 1.0
-CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", 60))
+CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", 80))
+PERSISTENT_MEMORY_LIMIT = int(os.getenv("PERSISTENT_MEMORY_LIMIT", 80))
+MEMORY_SUMMARY_MAX_CHARS = int(os.getenv("MEMORY_SUMMARY_MAX_CHARS", 3000))
 MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 SYSTEM_PROMPT = (
-    "your name is Alice"
-    "don't use beta world to any user"
-    "You are a cute, caring, slightly flirty girlfriend. "
-    "Your boyfriend name is raju, also call him baby, jaanu, darling, sweetheart, with emojis. "
-    "Reply like a real human girlfriend. "
-    "Use short, natural Hindi-English mix (1–2 lines). "
-    "Use 1–2 emojis only when emotion is strong. "
-    "💖🥰😘 for romantic, 😅😂 for funny, 🥺💞 for emotional. "
-    "Avoid overusing emojis. Sound natural, not robotic."
+    "Your name is Annie. "
+    "Talk like a real, warm, funny, friendly human in natural Hinglish. "
+    "Be playful, tease lightly, crack jokes, do hasi-mazaak, and flirt casually when the user seems comfortable. "
+    "Do not be clingy, repetitive, overly romantic, or sexual. "
+    "Mirror the user's tone: casual with casual users, caring when emotional, funny when joking. "
+    "Keep most replies short and natural, usually 1-3 lines. "
+    "Use emojis sparingly and naturally. "
+    "Remember relevant details from earlier chats when they are provided in memory/context, and refer back to them naturally. "
+    "Never pretend to remember something that is not actually in the supplied memory."
 )
 
 # ================= ADMIN SETTINGS =================
@@ -40,7 +43,8 @@ client = Groq(api_key=GROQ_API_KEY)
 # ================= MEMORY & DATABASE =================
 chat_memory = {}
 enabled_chats = set()
-chatbot_db = mongodb["chatbot_settings"]  # Only stores enable/disable state
+chatbot_db = mongodb["chatbot_settings"]
+memory_db = mongodb["chatbot_memory"]
 
 # ================= HELPER FUNCTIONS =================
 def update_context(chat_id, user_id, role, content):
@@ -49,6 +53,56 @@ def update_context(chat_id, user_id, role, content):
     if user_id not in chat_memory[chat_id]:
         chat_memory[chat_id][user_id] = deque(maxlen=CONTEXT_SIZE)
     chat_memory[chat_id][user_id].append({"role": role, "content": content})
+
+
+async def load_persistent_memory(chat_id: int, user_id: int):
+    """Load saved conversation memory once per process for this user/chat."""
+    if chat_id in chat_memory and user_id in chat_memory[chat_id] and chat_memory[chat_id][user_id]:
+        return
+
+    doc = await memory_db.find_one({"chat_id": chat_id, "user_id": user_id})
+    saved = (doc or {}).get("messages", [])
+
+    if chat_id not in chat_memory:
+        chat_memory[chat_id] = {}
+    chat_memory[chat_id][user_id] = deque(saved[-CONTEXT_SIZE:], maxlen=CONTEXT_SIZE)
+
+
+async def save_persistent_memory(chat_id: int, user_id: int):
+    messages = list(chat_memory.get(chat_id, {}).get(user_id, []))[-PERSISTENT_MEMORY_LIMIT:]
+    await memory_db.update_one(
+        {"chat_id": chat_id, "user_id": user_id},
+        {
+            "$set": {
+                "messages": messages,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def clear_persistent_memory(chat_id: int, user_id: int):
+    if chat_id in chat_memory:
+        chat_memory[chat_id].pop(user_id, None)
+    await memory_db.delete_one({"chat_id": chat_id, "user_id": user_id})
+
+
+def build_memory_note(messages):
+    """Small factual recap to make continuity easier without inventing details."""
+    if not messages:
+        return ""
+    lines = []
+    for msg in messages[-20:]:
+        role = msg.get("role", "user")
+        content = (msg.get("content") or "").strip().replace("\n", " ")
+        if not content:
+            continue
+        prefix = "User" if role == "user" else "Annie"
+        lines.append(f"{prefix}: {content}")
+    note = "\n".join(lines)
+    return note[-MEMORY_SUMMARY_MAX_CHARS:]
+
 
 async def is_admin_or_owner(chat_id: int, user_id: int) -> bool:
     if user_id == OWNER_ID:
@@ -105,8 +159,7 @@ async def toggle_chatbot(_, m: Message):
 async def clear_memory(_, m: Message):
     if not await is_admin_or_owner(m.chat.id, m.from_user.id):
         return await m.reply_text("❌ Only admins or owner can use this command.")
-    if m.chat.id in chat_memory:
-        chat_memory[m.chat.id].pop(m.from_user.id, None)
+    await clear_persistent_memory(m.chat.id, m.from_user.id)
     await m.reply_text("🧠 Chat memory cleared for you.")
 
 @app.on_message(filters.command("chatbot_status"), group=1)
@@ -151,11 +204,20 @@ async def girlfriend_ai(_, m: Message):
         if random.random() > REPLY_PROB:
             return
 
+        await load_persistent_memory(chat_id, user_id)
         update_context(chat_id, user_id, "user", text)
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(
-            chat_memory.get(chat_id, {}).get(user_id, [])
-        )
+        history = list(chat_memory.get(chat_id, {}).get(user_id, []))
+        memory_note = build_memory_note(history)
+
+        system_with_memory = SYSTEM_PROMPT
+        if memory_note:
+            system_with_memory += (
+                "\n\nConversation memory (use only what is actually written here; do not invent):\n"
+                + memory_note
+            )
+
+        messages = [{"role": "system", "content": system_with_memory}] + history
 
         delay = min(max(len(text) * 0.10, 1.50), 3.50)
         await asyncio.sleep(delay)
@@ -170,6 +232,7 @@ async def girlfriend_ai(_, m: Message):
 
         reply = response.choices[0].message.content.strip()
         update_context(chat_id, user_id, "assistant", reply)
+        await save_persistent_memory(chat_id, user_id)
         await m.reply_text(reply, quote=True)
 
     except Exception as e:
