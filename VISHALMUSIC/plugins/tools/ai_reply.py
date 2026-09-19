@@ -17,6 +17,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", 0))
 REPLY_PROB = float(os.getenv("REPLY_PROB", 0.71))  # 0.0 - 1.0
 CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", 80))
 PERSISTENT_MEMORY_LIMIT = int(os.getenv("PERSISTENT_MEMORY_LIMIT", 80))
+API_CONTEXT_MESSAGES = int(os.getenv("API_CONTEXT_MESSAGES", 12))
 MEMORY_SUMMARY_MAX_CHARS = int(os.getenv("MEMORY_SUMMARY_MAX_CHARS", 3000))
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
@@ -237,28 +238,46 @@ async def girlfriend_ai(_, m: Message):
         await load_persistent_memory(chat_id, user_id)
         update_context(chat_id, user_id, "user", text)
 
-        history = list(chat_memory.get(chat_id, {}).get(user_id, []))
-        memory_note = build_memory_note(history)
+        # Keep full recent memory in MongoDB/RAM, but send only a compact
+        # recent slice to Groq. Previously the same history was being sent twice
+        # (once inside the system prompt and once as messages), which quickly
+        # increased token/rate-limit usage after a few replies.
+        full_history = list(chat_memory.get(chat_id, {}).get(user_id, []))
+        api_history = full_history[-API_CONTEXT_MESSAGES:]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + api_history
 
-        system_with_memory = SYSTEM_PROMPT
-        if memory_note:
-            system_with_memory += (
-                "\n\nConversation memory (use only what is actually written here; do not invent):\n"
-                + memory_note
-            )
-
-        messages = [{"role": "system", "content": system_with_memory}] + history
-
-        delay = min(max(len(text) * 0.10, 1.50), 3.50)
+        delay = min(max(len(text) * 0.05, 0.4), 1.2)
         await asyncio.sleep(delay)
 
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=MODEL,
-            messages=messages,
-            temperature=0.6,
-            max_tokens=60,
-        )
+        response = None
+        last_error = None
+        for attempt in range(2):
+            try:
+                response = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model=MODEL,
+                    messages=messages,
+                    temperature=0.75,
+                    max_tokens=120,
+                )
+                break
+            except Exception as api_error:
+                last_error = api_error
+                err = str(api_error).lower()
+                # One small retry for temporary rate-limit/server errors.
+                if attempt == 0 and (
+                    "429" in err
+                    or "rate" in err
+                    or "timeout" in err
+                    or "503" in err
+                    or "502" in err
+                ):
+                    await asyncio.sleep(2)
+                    continue
+                raise
+
+        if response is None:
+            raise last_error or Exception("No response from Groq")
 
         reply = response.choices[0].message.content.strip()
         if not reply:
@@ -269,7 +288,7 @@ async def girlfriend_ai(_, m: Message):
         await save_persistent_memory(chat_id, user_id)
 
     except Exception as e:
-        print(f"[CHATBOT ERROR] chat={getattr(m.chat, 'id', None)}: {type(e).__name__}: {e}")
+        print(f"[CHATBOT ERROR] chat={getattr(m.chat, 'id', None)}: {type(e).__name__}: {e!r}")
         if LOGGER_ID:
             try:
                 await app.send_message(LOGGER_ID, f"⚠️ Chatbot Error: {type(e).__name__}: {e}")
