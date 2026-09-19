@@ -56,30 +56,38 @@ def update_context(chat_id, user_id, role, content):
 
 
 async def load_persistent_memory(chat_id: int, user_id: int):
-    """Load saved conversation memory once per process for this user/chat."""
+    """Load saved memory, but never block chatbot replies if MongoDB memory fails."""
     if chat_id in chat_memory and user_id in chat_memory[chat_id] and chat_memory[chat_id][user_id]:
         return
 
-    doc = await memory_db.find_one({"chat_id": chat_id, "user_id": user_id})
-    saved = (doc or {}).get("messages", [])
-
     if chat_id not in chat_memory:
         chat_memory[chat_id] = {}
-    chat_memory[chat_id][user_id] = deque(saved[-CONTEXT_SIZE:], maxlen=CONTEXT_SIZE)
+
+    try:
+        doc = await memory_db.find_one({"chat_id": chat_id, "user_id": user_id})
+        saved = (doc or {}).get("messages", [])
+        chat_memory[chat_id][user_id] = deque(saved[-CONTEXT_SIZE:], maxlen=CONTEXT_SIZE)
+    except Exception as e:
+        print(f"[CHATBOT MEMORY LOAD ERROR] chat={chat_id} user={user_id}: {e}")
+        chat_memory[chat_id][user_id] = deque(maxlen=CONTEXT_SIZE)
 
 
 async def save_persistent_memory(chat_id: int, user_id: int):
-    messages = list(chat_memory.get(chat_id, {}).get(user_id, []))[-PERSISTENT_MEMORY_LIMIT:]
-    await memory_db.update_one(
-        {"chat_id": chat_id, "user_id": user_id},
-        {
-            "$set": {
-                "messages": messages,
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
-        upsert=True,
-    )
+    """Save memory best-effort; a DB error must not stop the visible reply."""
+    try:
+        messages = list(chat_memory.get(chat_id, {}).get(user_id, []))[-PERSISTENT_MEMORY_LIMIT:]
+        await memory_db.update_one(
+            {"chat_id": chat_id, "user_id": user_id},
+            {
+                "$set": {
+                    "messages": messages,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[CHATBOT MEMORY SAVE ERROR] chat={chat_id} user={user_id}: {e}")
 
 
 async def clear_persistent_memory(chat_id: int, user_id: int):
@@ -231,13 +239,18 @@ async def girlfriend_ai(_, m: Message):
         )
 
         reply = response.choices[0].message.content.strip()
+        if not reply:
+            return
         update_context(chat_id, user_id, "assistant", reply)
-        await save_persistent_memory(chat_id, user_id)
+
+        # Reply first. Persistent memory is secondary and must never block chat.
         await m.reply_text(reply, quote=True)
+        await save_persistent_memory(chat_id, user_id)
 
     except Exception as e:
+        print(f"[CHATBOT ERROR] chat={getattr(m.chat, 'id', None)}: {type(e).__name__}: {e}")
         if LOGGER_ID:
             try:
-                await app.send_message(LOGGER_ID, f"⚠️ Chatbot Error: {e}")
+                await app.send_message(LOGGER_ID, f"⚠️ Chatbot Error: {type(e).__name__}: {e}")
             except:
                 pass
