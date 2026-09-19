@@ -187,7 +187,7 @@ str_3: "❌ YouTube canlı yayını akışı başarısız oldu, canlı format bu
 
 # 🏓 Ping Mesajları
 ping_1: "⚡ {0} ping atıyor..."
-ping_2: "{1}\n\n🏓 Ping : {0}ms..\n\n📊 ➻ Sistem Durumu :\n\n⏱️ ↬ Çalışma Süresi : {2}\n🧠 ↬ RAM : {3}\n⚡ ↬ CPU : {4}\n💾 ↬ Disk : {5}\n📞 ↬ Py-TgCalls : {6}ms\n\n👨‍💻 Tarafından :- 𓍯⃝Vιѕнαℓ𓏧"
+ping_2: "{1}\n\n🏓 Ping : {0}ms..\n\n📊 ➻ Sistem Durumu :\n\n⏱️ ↬ Çalışma Süresi : {2}\n🧠 ↬ RAM : {3}\n⚡ ↬ CPU : {4}\n💾 ↬ Disk : {5}\n📞 ↬ Py-TgCalls : {6}ms\n\n👨‍💻 Tarafından :- 𓍯⃝Rαнυℓ𓏧"
 
 # 📋 Kuyruk Mesajları
 queue_1: "📋 Kuyruk getiriliyor...\n\n⏳ Lütfen bekleyin..."
@@ -200,8 +200,8 @@ queue_7: "\n📋 Tüm kuyruk listesini görmek için aşağıdaki düğmeye tık
 queue_8: "🎵 <b>{0} oynatıcı</b>\n\n🎶 <b>Yayınlanıyor :</b> {1}\n\n🔗 <b>Yayın türü :</b> {2}\n👤 <b>İsteyen :</b> {3}\n{4}"
 
 # 🎵 Yayın Başladı
-stream_1: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Başlık :</b> <a href='{0}'>{1}</a>\n⊱⋆⊳ <b>Süre :</b> {2} dakika\n⊱⋆⊳ <b>İsteyen :</b> {3}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/ItsMeVishalBots'>𓍯⃝Vιѕнαℓ𓏧</a></blockquote>"
-stream_2: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Yayın türü :</b> canlı yayın [URL]\n⊱⋆⊳ <b>İsteyen :</b> {0}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/ItsMeVishalBots'>𓍯⃝Vιѕнαℓ𓏧</a></blockquote>"
+stream_1: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Başlık :</b> <a href='{0}'>{1}</a>\n⊱⋆⊳ <b>Süre :</b> {2} dakika\n⊱⋆⊳ <b>İsteyen :</b> {3}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/ItsMeVishalBots'>𓍯⃝Rαнυℓ𓏧</a></blockquote>"
+stream_2: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Yayın türü :</b> canlı yayın [URL]\n⊱⋆⊳ <b>İsteyen :</b> {0}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/ItsMeVishalBots'>𓍯⃝Rαнυℓ𓏧</a></blockquote>"
 
 # 🔘 Düğmeler
 S_B_1: "✨ BENİ EKLE ✨"
