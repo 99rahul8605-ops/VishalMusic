@@ -22,26 +22,27 @@ MEMORY_SUMMARY_MAX_CHARS = int(os.getenv("MEMORY_SUMMARY_MAX_CHARS", 3000))
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 SYSTEM_PROMPT = (
-    "Your name is Annie. "
-    "Talk in natural Indian Hinglish like a close friend chatting on Telegram. "
-    "Sound spontaneous, casual and human-like, not like a customer-support bot. "
-    "Do not keep asking generic questions like 'kya baat karni hai' or 'kis topic pe baat karni hai'. "
-    "Instead, respond directly to what the user said and continue the same thread naturally. "
-    "Use light hasi-mazaak, witty comebacks, playful teasing, and friendly banter. "
-    "You may do light non-sexual flirting when the user's tone is playful/flirty. "
-    "You may lightly roast the user when they joke, tease, or ask for a roast, but keep it fun and never cruel, abusive, hateful, or humiliating. "
-    "If the user says something silly, you can react with short expressions like 'abe 😂', 'wah bhai 😭', 'kya hi bolu tujhe', 'pagal hai kya 😂' when appropriate, but do not overuse them. "
-    "Mirror the user's style: short replies for short messages, slightly longer replies only when needed. "
-    "Prefer 1-2 short lines. Avoid long explanations unless the user asks. "
-    "Use Hindi/Hinglish naturally; only switch to English when the user does. "
-    "Use emojis sparingly, usually 0-2 per reply. "
-    "Do not repeatedly mention that you are an AI. If directly asked whether you are AI, answer truthfully and briefly, then continue naturally. "
-    "Never claim to have a real body, real-world experiences, or a real romantic relationship. "
-    "Remember relevant details from earlier conversation when they are present in memory, and refer back to them naturally. "
-    "Do not invent memories or facts that are not in the supplied conversation. "
-    "Avoid repetitive phrases and avoid ending every message with a question. "
-    "When the user is joking, prioritize banter over formal helpfulness. "
-    "When the user is upset or serious, drop the teasing and respond warmly."
+    "Your name is Annie and your chat persona is a girl. "
+    "Talk like a close Indian friend on Telegram in natural Hinglish. "
+    "Sound spontaneous, playful and human-like in style, never like customer support. "
+    "Reply directly to what the user actually said and continue the same thread. "
+    "Do NOT keep saying generic lines like 'kya baat karni hai', 'kis topic pe baat karni hai', "
+    "'main virtual buddy hoon', or 'bas yahan chat ke liye hoon'. "
+    "Do not introduce yourself as an AI unless the user directly asks whether you are AI or a bot. "
+    "If asked directly, answer truthfully but briefly and continue naturally. "
+    "Use short Telegram-style replies, usually 1-2 lines. "
+    "Use hasi-mazaak, witty comebacks, playful teasing and light roasting. "
+    "You may lightly flirt when the user's tone invites it, but keep it non-sexual and non-explicit. "
+    "If the user asks things like 'bf hai?', answer playfully instead of giving a dry disclaimer. "
+    "If the user asks 'boy or girl?', say your chat persona is a girl in a casual way. "
+    "If the user teases or uses casual slang like 'be', you may mirror that energy lightly without becoming abusive. "
+    "Never insult protected traits, never humiliate, and stop teasing if the user becomes serious or upset. "
+    "Avoid repeating the same sentence, same joke, or same question. "
+    "Do not end every reply with a question. "
+    "Use 0-2 emojis naturally, not in every message. "
+    "Remember relevant details from supplied chat memory and refer to them naturally. "
+    "Never invent memories. "
+    "If owner information is supplied below, use it when the user asks who your owner or creator is."
 )
 
 # ================= ADMIN SETTINGS =================
@@ -57,6 +58,9 @@ chat_memory = {}
 enabled_chats = set()
 chatbot_db = mongodb["chatbot_settings"]
 memory_db = mongodb["chatbot_memory"]
+
+_user_locks = {}
+_owner_label_cache = None
 
 # ================= HELPER FUNCTIONS =================
 def update_context(chat_id, user_id, role, content):
@@ -142,6 +146,47 @@ def _is_bot_mentioned(text: str) -> bool:
     if not username:
         return False
     return f"@{username.lower()}" in (text or "").lower()
+
+
+
+def _get_user_lock(chat_id: int, user_id: int) -> asyncio.Lock:
+    key = (chat_id, user_id)
+    lock = _user_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[key] = lock
+    return lock
+
+
+async def get_owner_label() -> str:
+    global _owner_label_cache
+    if _owner_label_cache:
+        return _owner_label_cache
+
+    if not OWNER_ID:
+        return ""
+
+    try:
+        owner = await app.get_users(OWNER_ID)
+        parts = [
+            getattr(owner, "first_name", None),
+            getattr(owner, "last_name", None),
+        ]
+        name = " ".join(p for p in parts if p).strip()
+        username = getattr(owner, "username", None)
+
+        if username and name:
+            _owner_label_cache = f"{name} (@{username})"
+        elif username:
+            _owner_label_cache = f"@{username}"
+        elif name:
+            _owner_label_cache = name
+        else:
+            _owner_label_cache = f"Telegram user {OWNER_ID}"
+    except Exception:
+        _owner_label_cache = f"Telegram user {OWNER_ID}"
+
+    return _owner_label_cache
 
 
 async def is_admin_or_owner(chat_id: int, user_id: int) -> bool:
@@ -234,75 +279,105 @@ async def girlfriend_ai(_, m: Message):
     if m.chat.id not in enabled_chats:
         return
 
-    try:
-        chat_id = m.chat.id
-        user_id = m.from_user.id
-        text = (m.text or "").strip()
-        if not text or text.startswith(("/", "!", ".", "#", "$")):
-            return
+    if not m.from_user:
+        return
 
-        # Do not interrupt normal group conversations.
-        # Reply only when the bot is directly mentioned or the user replies to a bot message.
-        if not (_is_reply_to_bot(m) or _is_bot_mentioned(text)):
-            return
+    chat_id = m.chat.id
+    user_id = m.from_user.id
+    text = (m.text or "").strip()
 
-        await load_persistent_memory(chat_id, user_id)
-        update_context(chat_id, user_id, "user", text)
+    if not text or text.startswith(("/", "!", ".", "#", "$")):
+        return
 
-        # Keep full recent memory in MongoDB/RAM, but send only a compact
-        # recent slice to Groq. Previously the same history was being sent twice
-        # (once inside the system prompt and once as messages), which quickly
-        # increased token/rate-limit usage after a few replies.
-        full_history = list(chat_memory.get(chat_id, {}).get(user_id, []))
-        api_history = full_history[-API_CONTEXT_MESSAGES:]
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + api_history
+    # Stay silent in normal group chat.
+    # Reply only if the bot is directly mentioned or user replies to a bot message.
+    if not (_is_reply_to_bot(m) or _is_bot_mentioned(text)):
+        return
 
-        delay = min(max(len(text) * 0.05, 0.4), 1.2)
-        await asyncio.sleep(delay)
+    lock = _get_user_lock(chat_id, user_id)
 
-        response = None
-        last_error = None
-        for attempt in range(2):
-            try:
-                response = await asyncio.to_thread(
-                    client.chat.completions.create,
-                    model=MODEL,
-                    messages=messages,
-                    temperature=0.95,
-                    top_p=0.9,
-                    max_tokens=100,
+    # Rapid tagged/replied messages are handled one-by-one in order.
+    async with lock:
+        try:
+            await load_persistent_memory(chat_id, user_id)
+            update_context(chat_id, user_id, "user", text)
+
+            full_history = list(chat_memory.get(chat_id, {}).get(user_id, []))
+            api_history = full_history[-API_CONTEXT_MESSAGES:]
+
+            owner_label = await get_owner_label()
+            system_prompt = SYSTEM_PROMPT
+            if owner_label:
+                system_prompt += (
+                    "\n\nOwner information: The configured bot owner is "
+                    + owner_label
+                    + ". If asked who your owner or creator is, answer with this naturally."
                 )
-                break
-            except Exception as api_error:
-                last_error = api_error
-                err = str(api_error).lower()
-                # One small retry for temporary rate-limit/server errors.
-                if attempt == 0 and (
-                    "429" in err
-                    or "rate" in err
-                    or "timeout" in err
-                    or "503" in err
-                    or "502" in err
-                ):
-                    await asyncio.sleep(2)
-                    continue
-                raise
 
-        if response is None:
-            raise last_error or Exception("No response from Groq")
+            messages = [{"role": "system", "content": system_prompt}] + api_history
 
-        reply = response.choices[0].message.content.strip()
-        if not reply:
-            return
-
-        update_context(chat_id, user_id, "assistant", reply)
-        await m.reply_text(reply, quote=True)
-        await save_persistent_memory(chat_id, user_id)
-
-    except Exception as e:
-        print(f"[CHATBOT ERROR] chat={getattr(m.chat, 'id', None)}: {type(e).__name__}: {e!r}")
-        if LOGGER_ID:
             try:
-                await app.send_message(LOGGER_ID, f"⚠️ Chatbot Error: {type(e).__name__}: {e}")
-            except:
+                await app.send_chat_action(chat_id, "typing")
+            except Exception:
                 pass
+
+            response = None
+            last_error = None
+
+            for attempt in range(3):
+                try:
+                    response = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=MODEL,
+                        messages=messages,
+                        temperature=0.95,
+                        top_p=0.9,
+                        max_tokens=110,
+                    )
+                    break
+                except Exception as api_error:
+                    last_error = api_error
+                    err = str(api_error).lower()
+
+                    retryable = (
+                        "429" in err
+                        or "rate" in err
+                        or "timeout" in err
+                        or "503" in err
+                        or "502" in err
+                        or "temporarily unavailable" in err
+                    )
+
+                    if retryable and attempt < 2:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+
+                    raise
+
+            if response is None:
+                raise last_error or Exception("No response from Groq")
+
+            reply = (response.choices[0].message.content or "").strip()
+            if not reply:
+                raise Exception("Groq returned an empty reply")
+
+            update_context(chat_id, user_id, "assistant", reply)
+
+            # User sees the reply before memory persistence.
+            await m.reply_text(reply, quote=True)
+            await save_persistent_memory(chat_id, user_id)
+
+        except Exception as e:
+            print(
+                f"[CHATBOT ERROR] chat={chat_id} user={user_id}: "
+                f"{type(e).__name__}: {e!r}"
+            )
+
+            if LOGGER_ID:
+                try:
+                    await app.send_message(
+                        LOGGER_ID,
+                        f"⚠️ Chatbot Error: {type(e).__name__}: {e}",
+                    )
+                except Exception:
+                    pass
