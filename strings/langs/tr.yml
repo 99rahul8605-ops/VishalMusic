@@ -99,7 +99,7 @@ admin_48: "🔊 Sesli sohbet {0} tarafından sesi açıldı!"
 
 # 🚀 Başlangıç Mesajları
 start_1: "🤖 {0} hayatta bebeğim.\n\n⏱️ Çalışma Süresi : {1}"
-start_2: "🌈🎶 Merhaba, {0} 💞\nBen {1} 🌟\n\n╭─━━━━━━━━━━⧫\n│ ✨ Müziği sevgiyle keşfedin ✨\n│ 🎧 Hepsi bir arada müzik botu\n╰─━━━━━━━━━━⧫\n╭─━━━━━━━━━━⧫\n│ 🎵 Sesli sohbette melodiler çalın\n│ 🖼️ Güzel görseller oluşturun\n│ 🌍 Metinleri çok dilli çevirin\n│ ⚡ Sohbetleri yönetin — sessize alma | yasaklama | yasağı kaldırma | atma\n│ 🌸 Özel karşılama mesajları\n│ 💫 Daha fazla özellik → komutlar düğmesine tıklayın\n╰─━━━━━━━━━━⧫\n📖 Tüm modülleri ve komutları keşfetmek için yardım düğmesine tıklayın 💖\n\n👨‍💻 Geliştirici : [𓍯⃝Vιѕнαℓ𓏧︎](https://t.me/ItsMeVishalBots)"
+start_2: "🌈🎶 Merhaba, {0} 💞\nBen {1} 🌟\n\n╭─━━━━━━━━━━⧫\n│ ✨ Müziği sevgiyle keşfedin ✨\n│ 🎧 Hepsi bir arada müzik botu\n╰─━━━━━━━━━━⧫\n╭─━━━━━━━━━━⧫\n│ 🎵 Sesli sohbette melodiler çalın\n│ 🖼️ Güzel görseller oluşturun\n│ 🌍 Metinleri çok dilli çevirin\n│ ⚡ Sohbetleri yönetin — sessize alma | yasaklama | yasağı kaldırma | atma\n│ 🌸 Özel karşılama mesajları\n│ 💫 Daha fazla özellik → komutlar düğmesine tıklayın\n╰─━━━━━━━━━━⧫\n📖 Tüm modülleri ve komutları keşfetmek için yardım düğmesine tıklayın 💖\n\n👨‍💻 Geliştirici : [𓍯⃝Vιѕнαℓ𓏧︎](https://t.me/team_secrat_bots)"
 start_3: "👋 Selam {0},\nBen {1}\n\n🙏 Beni {2} grubuna eklediğiniz için teşekkürler, {3} artık bu sohbette şarkılar çalabilir."
 start_4: "🎄 <b>Süper grup gerekiyor</b> 🎄\n\n🔧 Lütfen grubunuzu süper gruba çevirin ve ardından beni tekrar ekleyin.\n\n📖 Süper grup nasıl yapılır?\n- Grubunuzun sohbet geçmişini bir kez görünür yapın."
 start_5: "🚫 <b>↝ Kara Listeye Alınmış Sohbet ↜</b>\n\n🔒 Bu sohbet, {0} veritabanında kara listeye alınmış.\n🔓 Kara listeden çıkarılması için bir sudo kullanıcısına başvurun veya destek sohbetine gidin."
@@ -200,8 +200,8 @@ queue_7: "\n📋 Tüm kuyruk listesini görmek için aşağıdaki düğmeye tık
 queue_8: "🎵 <b>{0} oynatıcı</b>\n\n🎶 <b>Yayınlanıyor :</b> {1}\n\n🔗 <b>Yayın türü :</b> {2}\n👤 <b>İsteyen :</b> {3}\n{4}"
 
 # 🎵 Yayın Başladı
-stream_1: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Başlık :</b> <a href='{0}'>{1}</a>\n⊱⋆⊳ <b>Süre :</b> {2} dakika\n⊱⋆⊳ <b>İsteyen :</b> {3}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/ItsMeVishalBots'>𓍯⃝Rαнυℓ𓏧</a></blockquote>"
-stream_2: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Yayın türü :</b> canlı yayın [URL]\n⊱⋆⊳ <b>İsteyen :</b> {0}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/ItsMeVishalBots'>𓍯⃝Rαнυℓ𓏧</a></blockquote>"
+stream_1: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Başlık :</b> <a href='{0}'>{1}</a>\n⊱⋆⊳ <b>Süre :</b> {2} dakika\n⊱⋆⊳ <b>İsteyen :</b> {3}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/team_secrat_bots'>𓍯⃝Rαнυℓ𓏧</a></blockquote>"
+stream_2: "➲ <b>Yayın Başlatıldı |</b>\n<blockquote>⊱⋆⊳ <b>Yayın türü :</b> canlı yayın [URL]\n⊱⋆⊳ <b>İsteyen :</b> {0}</blockquote>\n<blockquote>⚡ <b>Yapan :</b> <a href='https://t.me/team_secrat_bots'>𓍯⃝Rαнυℓ𓏧</a></blockquote>"
 
 # 🔘 Düğmeler
 S_B_1: "✨ BENİ EKLE ✨"
