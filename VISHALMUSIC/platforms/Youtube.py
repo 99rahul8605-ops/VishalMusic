@@ -1148,6 +1148,36 @@ async def cached_youtube_search(query: str) -> List[Dict]:
             )
             result = []
 
+    # Final metadata fallback: explicit ytsearch syntax.
+    # Passing a plain song name to yt-dlp is not a reliable search fallback;
+    # ytsearch1:<query> is.
+    if not result and query and not str(query).startswith(("http://", "https://")):
+        try:
+            stdout, stderr = await _exec_proc(
+                "yt-dlp",
+                *(_cookies_args()),
+                "--no-warnings",
+                "--dump-json",
+                f"ytsearch1:{query}",
+            )
+            if stdout:
+                # yt-dlp may emit one JSON object per line.
+                first_line = stdout.decode("utf-8", errors="ignore").splitlines()[0]
+                item = json.loads(first_line)
+                if item and item.get("id"):
+                    result = [item]
+                    print(f"✅ Search via yt-dlp ytsearch fallback: {query}")
+            elif stderr:
+                print(
+                    f"⚠️ yt-dlp search fallback failed: "
+                    f"{stderr.decode('utf-8', errors='ignore')[:180]}"
+                )
+        except Exception as e:
+            print(
+                f"⚠️ yt-dlp search fallback error: "
+                f"{type(e).__name__}: {e}"
+            )
+
     if result:
         async with _cache_lock:
             _cache[key] = (time.time(), result)
@@ -1319,18 +1349,115 @@ class YouTubeAPI:
 
     @capture_internal_err
     async def track(self, link: str, videoid: Union[str, bool, None] = None) -> Tuple[Dict, str]:
-        try:
-            info = await self._fetch_video_info(self._prepare_link(link, videoid))
+        """
+        Resolve /play <song name> robustly.
+
+        Order for a text query:
+          1) Fast API /search (inside cached_youtube_search)
+          2) fresh Fast API retry
+          3) py_yt
+          4) explicit yt-dlp ytsearch1:<query>
+
+        The previous fallback passed the plain song name to yt-dlp, which can
+        return nothing and caused:
+            Track not found via API
+            Track not found (yt-dlp fallback)
+        """
+        prepared = self._prepare_link(link, videoid)
+        info = None
+
+        # Text query: use the full search chain.
+        if not prepared.startswith(("http://", "https://")):
+            try:
+                rows = await cached_youtube_search(prepared)
+                if rows:
+                    info = rows[0]
+            except Exception as e:
+                print(
+                    f"⚠️ Manual search chain failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+            # Independent py_yt attempt. This is intentionally repeated here
+            # so /play remains usable even if a helper/decorator path fails.
             if not info:
-                raise ValueError("Track not found via API")
-        except Exception:
-            _check_rate_limit()
-            prepared = self._prepare_link(link, videoid)
-            stdout, _ = await _exec_proc("yt-dlp", *(_cookies_args()), "--dump-json", prepared)
-            if not stdout:
-                raise ValueError("Track not found (yt-dlp fallback)")
-            info = json.loads(stdout.decode())
-        thumb = (info.get("thumbnail") or info.get("thumbnails", [{}])[0].get("url", "")).split("?")[0]
+                try:
+                    data = await asyncio.wait_for(
+                        VideosSearch(prepared, limit=1).next(),
+                        timeout=8,
+                    )
+                    rows = data.get("result", []) or []
+                    if rows:
+                        info = rows[0]
+                        print(f"✅ /play search via py_yt: {prepared}")
+                except Exception as e:
+                    print(
+                        f"⚠️ /play py_yt search failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+            # Explicit yt-dlp search, not a plain query argument.
+            if not info:
+                _check_rate_limit()
+                stdout, stderr = await _exec_proc(
+                    "yt-dlp",
+                    *(_cookies_args()),
+                    "--no-warnings",
+                    "--dump-json",
+                    f"ytsearch1:{prepared}",
+                )
+                if stdout:
+                    try:
+                        first_line = stdout.decode(
+                            "utf-8", errors="ignore"
+                        ).splitlines()[0]
+                        info = json.loads(first_line)
+                        print(f"✅ /play search via yt-dlp ytsearch: {prepared}")
+                    except Exception as e:
+                        print(
+                            f"⚠️ /play yt-dlp JSON parse failed: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                elif stderr:
+                    print(
+                        "⚠️ /play yt-dlp search failed: "
+                        + stderr.decode("utf-8", errors="ignore")[:220]
+                    )
+
+        # YouTube URL / explicit video ID path.
+        else:
+            try:
+                info = await self._fetch_video_info(prepared)
+            except Exception:
+                info = None
+
+            if not info:
+                _check_rate_limit()
+                stdout, stderr = await _exec_proc(
+                    "yt-dlp",
+                    *(_cookies_args()),
+                    "--no-warnings",
+                    "--dump-json",
+                    prepared,
+                )
+                if stdout:
+                    try:
+                        first_line = stdout.decode(
+                            "utf-8", errors="ignore"
+                        ).splitlines()[0]
+                        info = json.loads(first_line)
+                    except Exception:
+                        info = None
+
+        if not info or not info.get("id"):
+            raise ValueError("Track not found after Fast API + py_yt + ytsearch fallback")
+
+        thumb = (
+            info.get("thumbnail")
+            or (info.get("thumbnails") or [{}])[0].get("url", "")
+        )
+        thumb = thumb.split("?")[0] if thumb else ""
+
         _dur = info.get("duration")
         if isinstance(_dur, str) and _dur:
             duration_min = _dur
@@ -1339,14 +1466,23 @@ class YouTubeAPI:
             duration_min = f"{_secs // 60}:{_secs % 60:02d}"
         else:
             duration_min = None
+
+        vidid = info.get("id", "")
+        webpage_url = (
+            info.get("webpage_url")
+            or info.get("link")
+            or info.get("url")
+            or (self.base_url + vidid if vidid else prepared)
+        )
+
         details = {
             "title": info.get("title", ""),
-            "link": info.get("webpage_url", self._prepare_link(link, videoid)),
-            "vidid": info.get("id", ""),
+            "link": webpage_url,
+            "vidid": vidid,
             "duration_min": duration_min,
             "thumb": thumb,
         }
-        return details, info.get("id", "")
+        return details, vidid
 
     @capture_internal_err
     async def formats(self, link: str, videoid: Union[str, bool, None] = None) -> Tuple[List[Dict], str]:
