@@ -2,6 +2,8 @@ import asyncio
 import contextlib
 import json
 import os
+import sys
+import glob
 import re
 import time
 import aiohttp
@@ -34,7 +36,9 @@ _formats_lock = asyncio.Lock()
 # ============ API CONFIGURATION ============
 # Custom fast API from .env
 FAST_API_URL = os.getenv("API_URL", "").strip().rstrip("/")
-FAST_API_KEY = os.getenv("API_KEY", "").strip()
+FAST_API_KEY = os.getenv("API_KEY", "")
+AUDIO_DIRECT_STREAM_MB = float(os.getenv("AUDIO_DIRECT_STREAM_MB", "20"))
+AUDIO_DIRECT_STREAM_BYTES = int(AUDIO_DIRECT_STREAM_MB * 1024 * 1024).strip()
 
 # Existing Shruti API remains as fallback
 SHRUTI_API_KEY = "ShrutiBotspCO4qB3gMS2eDCpMeClO"
@@ -212,13 +216,65 @@ async def get_fast_audio_stream(link: str) -> Optional[str]:
 
 
 # ============ CUSTOM FAST API (PRIMARY AUDIO) ============
+
+async def _remote_media_size(session: aiohttp.ClientSession, url: str) -> int:
+    """
+    Best-effort remote size probe without downloading the whole song.
+    Returns total bytes, or 0 when the server does not expose a reliable size.
+    """
+    headers = {
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+    }
+
+    # HEAD is cheapest when supported.
+    try:
+        async with session.head(
+            url,
+            headers=headers,
+            allow_redirects=True,
+        ) as r:
+            if r.status < 400:
+                value = r.headers.get("Content-Length")
+                if value and value.isdigit():
+                    return int(value)
+    except Exception:
+        pass
+
+    # Some signed media hosts do not support HEAD. Ask only for byte 0 and
+    # read the total from Content-Range: bytes 0-0/TOTAL.
+    range_headers = dict(headers)
+    range_headers["Range"] = "bytes=0-0"
+    try:
+        async with session.get(
+            url,
+            headers=range_headers,
+            allow_redirects=True,
+        ) as r:
+            content_range = r.headers.get("Content-Range", "")
+            if "/" in content_range:
+                total = content_range.rsplit("/", 1)[-1].strip()
+                if total.isdigit():
+                    return int(total)
+
+            value = r.headers.get("Content-Length")
+            if r.status == 200 and value and value.isdigit():
+                return int(value)
+    except Exception:
+        pass
+
+    return 0
+
+
 async def download_song_fast_api(link: str) -> Optional[str]:
     """
-    Fast local audio download using the custom API's signed media URL.
+    Hybrid fast-audio mode:
 
-    This deliberately downloads the complete audio before VC playback.
-    It avoids the intermittent "timer is moving but assistant is silent"
-    problem seen with remote HTTP playback.
+    - <= AUDIO_DIRECT_STREAM_MB: download locally, then play the local file
+      for maximum VC reliability.
+    - > AUDIO_DIRECT_STREAM_MB: return the signed media URL for immediate
+      direct streaming, avoiding a long wait for large songs.
     """
     if not FAST_API_URL:
         return None
@@ -232,7 +288,7 @@ async def download_song_fast_api(link: str) -> Optional[str]:
         return None
 
     try:
-        print(f"⚡ Audio - Fast local download via API: {FAST_API_URL}")
+        print(f"⚡ Audio - Hybrid Fast API mode: {FAST_API_URL}")
 
         params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
         timeout = aiohttp.ClientTimeout(
@@ -284,16 +340,31 @@ async def download_song_fast_api(link: str) -> Optional[str]:
             file_path = os.path.join("downloads", f"{video_id}.{ext}")
             temp_path = file_path + ".part"
 
-            # Instant cache hit for replay/autoplay repeats.
+            # Probe size before deciding local vs direct.
+            remote_size = await _remote_media_size(session, stream_url)
+            if remote_size:
+                remote_mb = remote_size / (1024 * 1024)
+                print(f"ℹ️ Audio remote size: {remote_mb:.1f} MB")
+
+                if remote_size > AUDIO_DIRECT_STREAM_BYTES:
+                    print(
+                        f"🚀 Large audio > {AUDIO_DIRECT_STREAM_MB:g} MB: "
+                        "using direct stream"
+                    )
+                    return stream_url
+
+            # For small/unknown-size tracks, prefer local playback.
+            # Cache is used only for tracks within the local-download path.
             if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
-                print("✅ Audio: local cache hit")
-                return file_path
+                file_mb = os.path.getsize(file_path) / (1024 * 1024)
+                if file_mb <= AUDIO_DIRECT_STREAM_MB:
+                    print(f"✅ Audio: local cache hit ({file_mb:.1f} MB)")
+                    return file_path
 
             with contextlib.suppress(Exception):
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
 
-            # Step 2: pull the signed media as fast as the server/network allows.
             headers = {
                 "Accept": "*/*",
                 "Accept-Encoding": "identity",
@@ -313,11 +384,18 @@ async def download_song_fast_api(link: str) -> Optional[str]:
                     )
                     return None
 
-                expected = media.content_length or 0
-                downloaded = 0
+                expected = media.content_length or remote_size or 0
 
-                # 1 MiB chunks keep Python overhead low while still streaming
-                # efficiently to disk.
+                # A size may only become known on this GET.
+                if expected and expected > AUDIO_DIRECT_STREAM_BYTES:
+                    expected_mb = expected / (1024 * 1024)
+                    print(
+                        f"🚀 Large audio {expected_mb:.1f} MB > "
+                        f"{AUDIO_DIRECT_STREAM_MB:g} MB: using direct stream"
+                    )
+                    return stream_url
+
+                downloaded = 0
                 with open(temp_path, "wb", buffering=1024 * 1024) as f:
                     async for chunk in media.content.iter_chunked(1024 * 1024):
                         if not chunk:
@@ -331,7 +409,6 @@ async def download_song_fast_api(link: str) -> Optional[str]:
                 print("⚠️ Downloaded audio file is too small")
                 return None
 
-            # If Content-Length was available, reject obviously truncated files.
             if expected and downloaded < max(10240, int(expected * 0.97)):
                 with contextlib.suppress(Exception):
                     os.remove(temp_path)
@@ -352,7 +429,10 @@ async def download_song_fast_api(link: str) -> Optional[str]:
             return file_path
 
     except Exception as e:
-        print(f"❌ Fast API local download error: {e}")
+        print(
+            "❌ Fast API hybrid audio error: "
+            f"{type(e).__name__}: {e!r}"
+        )
         return None
 
 
@@ -570,6 +650,45 @@ async def download_video_fallback_api(link: str) -> str:
         return None
 
 
+
+def _find_cached_audio(video_id: str) -> Optional[str]:
+    """Find a real downloaded audio file without changing its extension."""
+    for ext in ("m4a", "webm", "opus", "ogg", "mp3", "mp4"):
+        p = os.path.join("downloads", f"{video_id}.{ext}")
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 10240:
+                return p
+        except Exception:
+            pass
+
+    for p in glob.glob(os.path.join("downloads", f"{video_id}.*")):
+        if p.endswith(".part"):
+            continue
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) > 10240:
+                return p
+        except Exception:
+            pass
+    return None
+
+
+def _yt_dlp_runtime_args() -> List[str]:
+    """Use Deno + EJS for current YouTube JS challenge handling."""
+    args = []
+
+    deno_path = shutil.which("deno")
+    if not deno_path and os.path.exists("/root/.deno/bin/deno"):
+        deno_path = "/root/.deno/bin/deno"
+
+    if deno_path:
+        args += ["--js-runtimes", f"deno:{deno_path}"]
+    else:
+        print("⚠️ Deno not found; yt-dlp JS challenge solving may fail")
+
+    args += ["--remote-components", "ejs:npm"]
+    return args
+
+
 # ============ YT-DLP FALLBACK ============
 async def download_video_ytdlp(link: str) -> str:
     """Download video using yt-dlp directly"""
@@ -639,75 +758,69 @@ async def download_video_ytdlp(link: str) -> str:
 
 
 async def download_audio_ytdlp(link: str) -> str:
-    """Download audio using yt-dlp directly"""
-    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+    """
+    Robust local yt-dlp fallback:
+    - Deno + EJS
+    - native audio container, no transcode
+    - preserves real extension
+    """
+    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
+    if "youtu.be/" in video_id:
+        video_id = video_id.split("youtu.be/")[-1].split("?")[0]
+    video_id = video_id.strip()
 
     if not video_id or len(video_id) < 3:
         return None
 
-    DOWNLOAD_DIR = "downloads"
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.webm")
+    os.makedirs("downloads", exist_ok=True)
 
-    if os.path.exists(file_path):
-        return file_path
+    cached = _find_cached_audio(video_id)
+    if cached:
+        print(f"✅ yt-dlp local cache: {cached}")
+        return cached
 
     _check_rate_limit()
-    
-    try:
-        ytdlp_opts = [
-            "yt-dlp",
-            *(_cookies_args()),
-            "--no-warnings",
-            "--geo-bypass",
-            "--force-ipv4",
-            "-f",
-            "bestaudio[ext=webm]/bestaudio",
-            "--extract-audio",
-            "--audio-format", "webm",
-            "-o",
-            file_path,
-            link
-        ]
-        
-        stdout, stderr = await _exec_proc(*ytdlp_opts)
-        
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
-            return file_path
-        else:
-            alternative_formats = ["bestaudio[ext=m4a]/bestaudio", "bestaudio/best", "worstaudio"]
-            
-            for fmt in alternative_formats:
-                try:
-                    alt_file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.webm")
-                    ytdlp_opts = [
-                        "yt-dlp",
-                        *(_cookies_args()),
-                        "--no-warnings",
-                        "--geo-bypass",
-                        "--force-ipv4",
-                        "-f",
-                        fmt,
-                        "--extract-audio",
-                        "--audio-format", "webm",
-                        "-o",
-                        alt_file_path,
-                        link
-                    ]
-                    
-                    stdout, stderr = await _exec_proc(*ytdlp_opts)
-                    
-                    if os.path.exists(alt_file_path) and os.path.getsize(alt_file_path) > 10240:
-                        return alt_file_path
-                    
-                    await asyncio.sleep(1)
-                except Exception:
-                    continue
-            
-            return None
 
-    except Exception as e:
-        return None
+    output_template = os.path.join("downloads", f"{video_id}.%(ext)s")
+    formats = [
+        "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "bestaudio/best",
+    ]
+
+    for idx, fmt in enumerate(formats, start=1):
+        try:
+            cmd = [
+                sys.executable, "-m", "yt_dlp",
+                *(_cookies_args()),
+                *(_yt_dlp_runtime_args()),
+                "--no-playlist",
+                "--no-warnings",
+                "--geo-bypass",
+                "--force-ipv4",
+                "--retries", "3",
+                "--fragment-retries", "3",
+                "--socket-timeout", "20",
+                "-f", fmt,
+                "-o", output_template,
+                link,
+            ]
+
+            print(f"🔄 yt-dlp local fallback attempt {idx}/{len(formats)}")
+            stdout, stderr = await _exec_proc(*cmd)
+
+            cached = _find_cached_audio(video_id)
+            if cached:
+                print(f"✅ yt-dlp local audio ready: {cached}")
+                return cached
+
+            err = stderr.decode("utf-8", "ignore").strip()
+            if err:
+                print(f"⚠️ yt-dlp attempt {idx} failed: {err[-700:]}")
+
+        except Exception as e:
+            print(f"⚠️ yt-dlp attempt {idx} exception: {e}")
+
+    return None
 
 
 # ============ MAIN DOWNLOAD FUNCTIONS (API1 -> API2 -> YTDLP) ============
@@ -1134,7 +1247,20 @@ class YouTubeAPI:
         extension = ".webm" if not video else ".mp4"
         common_file_path = os.path.join("downloads", f"{video_id}{extension}")
         
-        if os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
+        if not video:
+            cached_audio = _find_cached_audio(video_id)
+            if cached_audio:
+                cached_size = os.path.getsize(cached_audio)
+                cached_mb = cached_size / (1024 * 1024)
+                if cached_size <= AUDIO_DIRECT_STREAM_BYTES:
+                    print(f"✅ Local audio cache: {cached_audio} ({cached_mb:.1f} MB)")
+                    return cached_audio, True
+
+                print(
+                    f"ℹ️ Cached audio is {cached_mb:.1f} MB > "
+                    f"{AUDIO_DIRECT_STREAM_MB:g} MB; preferring direct stream"
+                )
+        elif os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
             print("✅ Local cache")
             return common_file_path, True
 
@@ -1168,21 +1294,19 @@ class YouTubeAPI:
             try:
                 audio_result = await download_audio(link)
                 if audio_result:
+                    if str(audio_result).startswith(("http://", "https://")):
+                        print("🚀 Audio ready as direct stream (large track)")
+                        return audio_result, None
+
                     print(f"✅ Audio ready from local file: {audio_result}")
                     return audio_result, True
             except Exception as e:
-                print(f"❌ Audio download error: {str(e)}")
+                print(f"❌ Audio download error: {type(e).__name__}: {e!r}")
             
             try:
                 p = await yt_dlp_download(link, type="audio")
                 if p and os.path.exists(p) and os.path.getsize(p) > 10240:
-                    print("✅ yt-dlp (original)")
-                    if p != common_file_path:
-                        try:
-                            shutil.move(p, common_file_path)
-                            return common_file_path, True
-                        except Exception:
-                            return p, True
+                    print(f"✅ yt-dlp (original): {p}")
                     return p, True
             except Exception as e:
                 print(f"❌ Original yt-dlp error: {str(e)}")
@@ -1190,13 +1314,7 @@ class YouTubeAPI:
             try:
                 p = await download_audio_concurrent(link)
                 if p and os.path.exists(p) and os.path.getsize(p) > 10240:
-                    print("✅ concurrent")
-                    if p != common_file_path:
-                        try:
-                            shutil.move(p, common_file_path)
-                            return common_file_path, True
-                        except Exception:
-                            return p, True
+                    print(f"✅ concurrent: {p}")
                     return p, True
             except Exception as e:
                 print(f"❌ Concurrent download error: {str(e)}")
