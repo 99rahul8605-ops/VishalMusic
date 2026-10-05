@@ -48,6 +48,15 @@ def dynamic_media_stream(path: str, video: bool = False, ffmpeg_params: str = No
         ffmpeg_parameters=ffmpeg_params,
     )
 
+def _reset_autoplay_session_state(chat_id: int) -> None:
+    """Clear autoplay repeat history only when the real playback session ends."""
+    try:
+        from VISHALMUSIC.utils.stream.autoplay import reset_autoplay_session
+        reset_autoplay_session(chat_id)
+    except Exception:
+        pass
+
+
 async def _clear_(chat_id: int) -> None:
     popped = db.pop(chat_id, None)
     if popped:
@@ -110,6 +119,7 @@ class Call:
     @capture_internal_err
     async def stop_stream(self, chat_id: int) -> None:
         assistant = await group_assistant(self, chat_id)
+        _reset_autoplay_session_state(chat_id)
         await _clear_(chat_id)
         if chat_id not in self.active_calls:
             return
@@ -130,6 +140,7 @@ class Call:
     @capture_internal_err
     async def force_stop_stream(self, chat_id: int) -> None:
         assistant = await group_assistant(self, chat_id)
+        _reset_autoplay_session_state(chat_id)
         try:
             check = db.get(chat_id)
             if check:
@@ -299,6 +310,7 @@ class Call:
                 if autoplay_started:
                     return
 
+                _reset_autoplay_session_state(chat_id)
                 await _clear_(chat_id)
                 if chat_id in self.active_calls:
                     try:
@@ -312,6 +324,7 @@ class Call:
                 return
         except:
             try:
+                _reset_autoplay_session_state(chat_id)
                 await _clear_(chat_id)
                 return await client.leave_call(chat_id)
             except:
