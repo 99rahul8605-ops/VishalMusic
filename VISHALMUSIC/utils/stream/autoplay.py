@@ -25,7 +25,6 @@ RECENT_TITLES = {}
 RECENT_MOVIES = {}
 AUTO_PLAYING = {}
 AUTOPLAY_CONTEXT = {}
-AUTOPLAY_SESSION_TOKEN = {}
 
 # Autoplay recommendation tuning
 AUTOPLAY_MIN_SECONDS = int(os.getenv("AUTOPLAY_MIN_SECONDS", "100"))
@@ -481,39 +480,36 @@ def _same_song(stored: str, candidate: str) -> bool:
     return SequenceMatcher(None, a, b).ratio() >= 0.82
 
 
-def _reset_session_history(chat_id: int) -> None:
-    """Clear repeat history only for this chat/session."""
+def reset_autoplay_session(chat_id: int) -> None:
+    """
+    Reset repeat/recommendation history ONLY when the real VC playback session
+    ends. call.py calls this on actual stop/leave.
+
+    Important: autoplay's prepare_autoplay() may recreate db[chat_id] while the
+    assistant stays in VC. That is NOT a new session and must not reset history.
+    """
     RECENT.pop(chat_id, None)
     RECENT_TITLES.pop(chat_id, None)
     RECENT_MOVIES.pop(chat_id, None)
     AUTOPLAY_CONTEXT.pop(chat_id, None)
+    AUTO_PLAYING.pop(chat_id, None)
+    print(f"🧹 Autoplay session history cleared: {chat_id}")
 
 
 def _ensure_autoplay_session(chat_id: int) -> None:
     """
-    Keep repeat blocking scoped to one active playback session.
+    No queue-object based reset here.
 
-    `db[chat_id]` is the queue list used by the music session. The project
-    recreates that list when a call/session is cleared and keeps the same list
-    while manual songs + autoplay continue in the same voice-chat session.
+    The old v7/v8 logic used id(db[chat_id]) as a session token. But
+    prepare_autoplay() intentionally clears/recreates the queue on next/autoplay
+    while keeping the same voice-chat session alive, so /next looked like a new
+    session and wiped repeat history.
 
-    Therefore:
-      - same session, same group -> repeat history stays
-      - bot leaves and a new session starts -> history resets
-      - another group/channel -> separate chat_id, separate history
+    Real session resets are now explicit via reset_autoplay_session().
     """
-    queue = db.get(chat_id)
-    token = id(queue) if queue is not None else None
-    old_token = AUTOPLAY_SESSION_TOKEN.get(chat_id)
-
-    if old_token is None:
-        AUTOPLAY_SESSION_TOKEN[chat_id] = token
-        return
-
-    if old_token != token:
-        _reset_session_history(chat_id)
-        AUTOPLAY_SESSION_TOKEN[chat_id] = token
-        print(f"🧹 Autoplay repeat history reset for new session: {chat_id}")
+    RECENT.setdefault(chat_id, [])
+    RECENT_TITLES.setdefault(chat_id, [])
+    RECENT_MOVIES.setdefault(chat_id, [])
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
