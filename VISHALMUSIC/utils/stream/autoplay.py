@@ -576,6 +576,55 @@ def _thumb_from_item(item: dict) -> str:
     return ""
 
 
+
+def parse_view_count(value) -> int:
+    """
+    Parse py_yt view-count variants into an integer.
+    Examples:
+      1,234,567
+      "1.2M views"
+      {"text": "12M views"}
+    """
+    if value is None:
+        return 0
+
+    if isinstance(value, dict):
+        value = (
+            value.get("text")
+            or value.get("short")
+            or value.get("simpleText")
+            or value.get("viewCount")
+            or ""
+        )
+
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+
+    s = str(value).strip().lower().replace(",", "")
+    if not s:
+        return 0
+
+    m = re.search(r"([\d.]+)\s*([kmb])?", s)
+    if not m:
+        return 0
+
+    try:
+        number = float(m.group(1))
+    except Exception:
+        return 0
+
+    suffix = m.group(2)
+    mult = 1
+    if suffix == "k":
+        mult = 1_000
+    elif suffix == "m":
+        mult = 1_000_000
+    elif suffix == "b":
+        mult = 1_000_000_000
+
+    return int(number * mult)
+
+
 async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY):
     """
     Candidate search only.
@@ -602,6 +651,11 @@ async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY):
                     "channel": item.get("channel")
                     or item.get("channelTitle")
                     or "",
+                    "views": parse_view_count(
+                        item.get("viewCount")
+                        or item.get("views")
+                        or item.get("view_count")
+                    ),
                     "_search_query": query,
                 }
             )
@@ -617,60 +671,44 @@ async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY):
 
 def build_smart_queries(title, artist, movie, lang, mood):
     """
-    Strict recommendation priority:
-      1) LANGUAGE
-      2) SINGER (same singer preferred; different singer is allowed)
-      3) CATEGORY / MOOD
+    Recommendation priority:
+      1) LANGUAGE must stay the same
+      2) HIT / POPULAR songs get strong preference
+      3) Same singer gets a smaller bonus, but is NOT required
+      4) Mood/category helps ranking
 
-    Every query contains the target language. We intentionally do not search
-    the current movie or "songs like <title>" because those were producing
-    repetitive soundtrack results and unrelated recommendations.
+    This avoids getting stuck on one singer while still keeping recommendations
+    familiar and popular.
     """
     queries = []
 
-    # Priority 1 + 2 + 3: ideal match.
-    if artist and mood and mood != "normal":
-        queries.append(
-            {
-                "q": f"{lang} {artist} {mood} songs official audio",
-                "kind": "artist_mood",
-            }
-        )
-
-    # Priority 1 + 2: same singer in same language.
-    if artist:
-        queries += [
-            {
-                "q": f"{lang} {artist} songs official audio",
-                "kind": "artist",
-            },
-            {
-                "q": f"{lang} {artist} hit songs",
-                "kind": "artist",
-            },
-        ]
-
-    # Priority 1 + 3: same language + same category/mood, any singer.
-    if mood and mood != "normal":
-        queries += [
-            {
-                "q": f"{lang} {mood} songs official audio",
-                "kind": "mood",
-            },
-            {
-                "q": f"popular {lang} {mood} songs",
-                "kind": "mood",
-            },
-        ]
-
-    # Priority 1 only: same language, any singer/category.
+    # Language + hit/popular searches first.
     queries += [
-        {"q": f"{lang} hit songs official audio", "kind": "language"},
-        {"q": f"popular {lang} songs official audio", "kind": "language"},
-        {"q": f"latest {lang} songs official audio", "kind": "language"},
+        {"q": f"{lang} hit songs official audio", "kind": "hit"},
+        {"q": f"popular {lang} songs official audio", "kind": "hit"},
+        {"q": f"top {lang} songs official audio", "kind": "hit"},
     ]
 
-    # Deduplicate while preserving strict order.
+    # Same language + same mood/category.
+    if mood and mood != "normal":
+        queries += [
+            {"q": f"{lang} {mood} hit songs official audio", "kind": "mood_hit"},
+            {"q": f"popular {lang} {mood} songs", "kind": "mood_hit"},
+        ]
+
+    # Same singer is useful, but intentionally lower priority than hit songs.
+    if artist:
+        queries += [
+            {"q": f"{lang} {artist} hit songs official audio", "kind": "artist"},
+            {"q": f"{lang} {artist} popular songs", "kind": "artist"},
+        ]
+
+    # Final same-language pool.
+    queries += [
+        {"q": f"latest {lang} songs official audio", "kind": "language"},
+        {"q": f"{lang} chart songs official audio", "kind": "language"},
+    ]
+
     final = []
     seen = set()
     for item in queries:
@@ -680,7 +718,7 @@ def build_smart_queries(title, artist, movie, lang, mood):
             seen.add(key)
             final.append({"q": q, "kind": item["kind"]})
 
-    return final[:8]
+    return final[:9]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -730,10 +768,10 @@ async def get_ranked_songs(
     ]
 
     kind_bonus = {
-        "artist_mood": 360,
-        "artist": 300,
-        "mood": 180,
-        "language": 100,
+        "hit": 320,
+        "mood_hit": 280,
+        "artist": 180,
+        "language": 120,
     }
 
     seen_vids = set()
@@ -800,7 +838,7 @@ async def get_ranked_songs(
                 # singer/mood priorities.
                 score += max(0, 35 - query_index * 4 - result_index * 3)
 
-                # PRIORITY #2 — SINGER
+                # Same singer is only a soft preference, not a requirement.
                 same_artist = False
                 if artist:
                     artist_lower = artist.lower()
@@ -809,23 +847,21 @@ async def get_ranked_songs(
                         or artist_lower in channel
                     )
                     if same_artist:
-                        score += 420
-                    elif kind in {"artist", "artist_mood"}:
-                        # Search was for the same singer but result does not
-                        # confirm it. Keep it usable, just below confirmed artist.
-                        score -= 80
+                        score += 150
+                    elif kind == "artist":
+                        score -= 20
 
-                # PRIORITY #3 — CATEGORY / MOOD
+                # Mood/category remains useful after language + hit popularity.
                 mood_match = False
                 if mood and mood != "normal":
                     mood_keys = MOOD_DB.get(mood, [])
                     mood_match = any(x in combined for x in mood_keys)
                     if mood_match:
-                        score += 210
-                    elif kind in {"mood", "artist_mood"}:
-                        # Query itself is mood-specific, so do not punish heavily
-                        # when the title does not literally say "sad"/"romantic".
-                        score += 45
+                        score += 160
+                    elif kind == "mood_hit":
+                        # Query itself is mood-specific, so give a small bonus
+                        # even when the title does not literally say the mood.
+                        score += 35
 
                 # Do not get stuck on one soundtrack. This is only a lower-level
                 # diversity penalty; language/singer/mood always come first.
@@ -838,6 +874,28 @@ async def get_ranked_songs(
                     score -= 90
                 elif candidate_movie and candidate_movie in recent_movies:
                     score -= 45
+
+                # HIT / POPULARITY preference.
+                # Views are a strong signal, but never override a wrong-language
+                # rejection above.
+                views = int(details.get("views") or 0)
+                if views >= 100_000_000:
+                    score += 260
+                elif views >= 50_000_000:
+                    score += 220
+                elif views >= 20_000_000:
+                    score += 180
+                elif views >= 10_000_000:
+                    score += 150
+                elif views >= 5_000_000:
+                    score += 120
+                elif views >= 1_000_000:
+                    score += 90
+                elif views >= 250_000:
+                    score += 45
+
+                if any(x in title_lower for x in ["hit", "superhit", "popular"]):
+                    score += 45
 
                 # Quality / normal-song preferences.
                 if "official" in title_lower:
@@ -1036,8 +1094,8 @@ async def auto_play_next(
         if not ranked:
             # Final fallback is STILL same-language only.
             fallback_queries = [
-                {"q": f"{lang} hit songs official audio", "kind": "language"},
-                {"q": f"popular {lang} songs", "kind": "language"},
+                {"q": f"{lang} hit songs official audio", "kind": "hit"},
+                {"q": f"popular {lang} songs", "kind": "hit"},
                 {"q": f"latest {lang} songs", "kind": "language"},
             ]
 
@@ -1079,6 +1137,7 @@ async def auto_play_next(
                 f"| language={lang} "
                 f"| singer={artist or 'any'} "
                 f"| mood={mood} "
+                f"| views={details.get('views', 0)} "
                 f"| score={score}"
             )
 
