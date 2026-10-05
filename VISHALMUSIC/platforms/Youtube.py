@@ -510,10 +510,12 @@ async def download_song_fast_api(link: str) -> Optional[str]:
 
 async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[str]:
     """
-    Direct-stream Fast API mode.
+    Fast API proxy-stream mode.
 
-    Fast API extracts the signed media URL and we return it immediately to
-    PyTgCalls/FFmpeg. No local audio download, size probe, or parallel ranges.
+    We still stream immediately (no full local download), but PyTgCalls/FFmpeg
+    connects to our API /audio endpoint instead of directly to googlevideo.
+    This avoids the recurring "timer moves but no voice" / raw signed-URL issue
+    and also lets the API refresh a media URL on upstream 403.
     """
     if not FAST_API_URL:
         return None
@@ -527,53 +529,49 @@ async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[s
         return None
 
     try:
-        print(f"⚡ Audio - Fast API direct stream mode: {FAST_API_URL}")
+        print(f"⚡ Audio - Fast API proxy stream mode: {FAST_API_URL}")
 
-        params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
+        params = {}
+        if FAST_API_KEY:
+            params["api_key"] = FAST_API_KEY
 
-        timeout = aiohttp.ClientTimeout(
-            total=25,
-            connect=8,
-            sock_connect=8,
-            sock_read=18,
-        )
-
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Preflight /song once. This preserves the existing fallback chain if
+        # extraction itself fails, and it warms the short API song cache so
+        # /audio can begin streaming immediately.
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=25,
+                connect=8,
+                sock_connect=8,
+                sock_read=18,
+            )
+        ) as session:
             async with session.get(
                 f"{FAST_API_URL}/song/{video_id}",
                 params=params,
             ) as response:
-                if response.status != 200:
-                    body = await response.text()
+                data = await response.json(content_type=None)
+
+                if response.status != 200 or data.get("status") != "done":
                     print(
-                        f"⚠️ Fast API returned {response.status}: "
-                        f"{body[:250]}"
+                        f"⚠️ Fast API song extraction failed: "
+                        f"{response.status} {str(data)[:220]}"
                     )
                     return None
 
-                data = await response.json(content_type=None)
+        proxy_url = f"{FAST_API_URL}/audio/{video_id}"
+        if FAST_API_KEY:
+            proxy_url += f"?api_key={FAST_API_KEY}"
 
-        if data.get("status") != "done":
-            print(
-                "⚠️ Fast API extraction failed: "
-                f"{data.get('message', 'unknown error')}"
-            )
-            return None
-
-        stream_url = data.get("link")
-        if not stream_url or not str(stream_url).startswith(("http://", "https://")):
-            print("⚠️ Fast API returned no valid audio stream URL")
-            return None
-
-        print("🚀 Audio direct stream ready")
-        return str(stream_url)
+        print("🚀 Audio proxy stream ready")
+        return proxy_url
 
     except asyncio.TimeoutError:
-        print("❌ Fast API direct stream timeout")
+        print("❌ Fast API proxy stream timeout")
         return None
     except Exception as e:
         print(
-            f"❌ Fast API direct stream error: "
+            f"❌ Fast API proxy stream error: "
             f"{type(e).__name__}: {e!r}"
         )
         return None
@@ -1044,73 +1042,115 @@ async def cached_youtube_search(query: str) -> List[Dict]:
             if now - ts < YOUTUBE_META_TTL:
                 return val
             _cache.pop(key, None)
+
         if len(_cache) > YOUTUBE_META_MAX:
             _cache.clear()
 
     result: List[Dict] = []
 
-    # 1) Fast API search by song name
-    if FAST_API_URL:
-        try:
-            params = {
-                "q": query,
-                "limit": 1,
-            }
-            if FAST_API_KEY:
-                params["api_key"] = FAST_API_KEY
+    async def _fast_api_search(*, fresh: bool, limit: int) -> List[Dict]:
+        if not FAST_API_URL:
+            return []
 
+        params = {
+            "q": query,
+            "limit": limit,
+        }
+        if FAST_API_KEY:
+            params["api_key"] = FAST_API_KEY
+        if fresh:
+            params["fresh"] = 1
+
+        try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=20)
+                timeout=aiohttp.ClientTimeout(
+                    total=12,
+                    connect=5,
+                    sock_connect=5,
+                    sock_read=10,
+                )
             ) as session:
                 async with session.get(
                     f"{FAST_API_URL}/search",
                     params=params,
                 ) as response:
-                    if response.status == 200:
-                        data = await response.json(content_type=None)
-                        api_results = data.get("results", [])
+                    data = await response.json(content_type=None)
 
-                        for item in api_results:
-                            video_id = item.get("id") or item.get("video_id") or ""
-                            title = item.get("title", "")
-                            duration = item.get("duration")
-                            thumbnail = item.get("thumbnail") or ""
-                            channel = item.get("channel") or item.get("uploader") or ""
+                    if response.status != 200:
+                        print(
+                            f"⚠️ Fast API search returned "
+                            f"{response.status}: {str(data)[:180]}"
+                        )
+                        return []
 
-                            # Normalize to the structure expected by the existing bot
-                            result.append({
-                                "id": video_id,
-                                "title": title,
-                                "duration": duration,
-                                "thumbnail": thumbnail,
-                                "thumbnails": [{"url": thumbnail}] if thumbnail else [],
-                                "channel": channel,
-                                "webpage_url": (
-                                    f"https://www.youtube.com/watch?v={video_id}"
-                                    if video_id else ""
-                                ),
-                            })
+                    rows = data.get("results") or []
+                    normalized = []
 
-                        if result:
-                            print(f"✅ Search via Fast API: {query}")
-                    else:
-                        print(f"⚠️ Fast API search returned status {response.status}")
+                    for item in rows:
+                        video_id = item.get("id") or item.get("video_id") or ""
+                        if not video_id:
+                            continue
+
+                        thumbnail = item.get("thumbnail") or ""
+                        normalized.append({
+                            "id": video_id,
+                            "title": item.get("title", ""),
+                            "duration": item.get("duration"),
+                            "thumbnail": thumbnail,
+                            "thumbnails": (
+                                [{"url": thumbnail}] if thumbnail else []
+                            ),
+                            "channel": (
+                                item.get("channel")
+                                or item.get("uploader")
+                                or ""
+                            ),
+                            "webpage_url": (
+                                f"https://www.youtube.com/watch?v={video_id}"
+                            ),
+                        })
+
+                    return normalized
+
         except Exception as e:
-            print(f"⚠️ Fast API search failed: {e}")
+            print(
+                f"⚠️ Fast API search "
+                f"{'fresh retry' if fresh else 'request'} failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            return []
 
-    # 2) Existing py_yt search as fallback
+    # 1) Fast API remains PRIMARY.
+    result = await _fast_api_search(fresh=False, limit=1)
+
+    # 2) If API returned empty/error, force one fresh search immediately.
+    #    Empty API results are not allowed to poison future searches.
     if not result:
+        print(f"↻ Fast API search empty; fresh retry: {query}")
+        result = await _fast_api_search(fresh=True, limit=5)
+
+    if result:
+        print(f"✅ Search via Fast API: {query}")
+    else:
+        # 3) Existing py_yt fallback only after both API attempts fail.
         try:
-            data = await VideosSearch(query, limit=1).next()
-            result = data.get("result", [])
+            data = await asyncio.wait_for(
+                VideosSearch(query, limit=1).next(),
+                timeout=8,
+            )
+            result = data.get("result", []) or []
             if result:
                 print(f"✅ Search via py_yt fallback: {query}")
-        except Exception:
+        except Exception as e:
+            print(
+                f"⚠️ py_yt search fallback failed: "
+                f"{type(e).__name__}: {e}"
+            )
             result = []
 
     if result:
         async with _cache_lock:
-            _cache[key] = (now, result)
+            _cache[key] = (time.time(), result)
 
     return result
 
@@ -1389,7 +1429,7 @@ class YouTubeAPI:
         extension = ".webm" if not video else ".mp4"
         common_file_path = os.path.join("downloads", f"{video_id}{extension}")
         
-        # Direct-stream mode intentionally ignores existing local audio files
+        # Proxy-stream mode intentionally ignores existing local audio files
         # so manual play/autoplay can start immediately from the Fast API URL.
         if video and os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
             print("✅ Local video cache")
@@ -1418,14 +1458,14 @@ class YouTubeAPI:
                 return None, None
 
         else:
-            # Fast-start VC mode:
-            # Successful Fast API audio is streamed directly. Local files are
-            # only used by fallback methods if the Fast API fails.
+            # Fast-start stable VC mode:
+            # Successful Fast API audio streams through the API proxy. No full
+            # local download; fallback methods remain available if API fails.
             try:
                 audio_result = await download_audio(link)
                 if audio_result:
                     if str(audio_result).startswith(("http://", "https://")):
-                        print("🚀 Audio ready as direct stream")
+                        print("🚀 Audio ready as API proxy stream")
                         return audio_result, None
 
                     print(f"✅ Audio fallback ready from local file: {audio_result}")
