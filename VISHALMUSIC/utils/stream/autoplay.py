@@ -53,9 +53,13 @@ LANG_DB = {
         "justin bieber", "dua lipa", "weeknd",
     ],
     "bhojpuri": [
-        "bhojpuri", "bhojpuri song", "pawan singh", "khesari",
-        "nirahua", "saiya", "saiyan", "raja ji", "tohar", "hamra",
-        "bhojpuriya",
+        "bhojpuri", "bhojpuri song", "hamaar bhojpuri",
+        "pawan singh", "khesari", "khesari lal", "shilpi raj",
+        "akshara singh", "nirahua", "neelkamal singh",
+        "arvind akela kallu", "pramod premi", "ritesh pandey",
+        "saiya", "saiyan", "raja ji", "tohar", "hamra", "bhojpuriya",
+        "raate diya", "diya butake", "butake", "ka ho", "ae raja",
+        "ho raja", "tohra", "hamke", "raua", "babua", "bhatar",
     ],
     "haryanvi": [
         "haryanvi", "haryanvi song", "khasa", "masoom sharma",
@@ -93,7 +97,17 @@ ARTIST_LANG = {
     "diljit dosanjh": "punjabi",
     "karan aujla": "punjabi",
     "ap dhillon": "punjabi",
-    "gurinder gill": "punjabi",
+    "gurinder gill": "punjabi",    "pawan singh": "bhojpuri",
+    "khesari lal yadav": "bhojpuri",
+    "khesari": "bhojpuri",
+    "shilpi raj": "bhojpuri",
+    "akshara singh": "bhojpuri",
+    "ritesh pandey": "bhojpuri",
+    "pramod premi yadav": "bhojpuri",
+    "neelkamal singh": "bhojpuri",
+    "arvind akela kallu": "bhojpuri",
+    "dinesh lal yadav": "bhojpuri",
+    "nirahua": "bhojpuri",
 }
 
 
@@ -154,7 +168,15 @@ ARTIST_DB = {
     "kishore kumar": ["kishore", "kishore kumar", "kishore song"],
     "mohammad rafi": ["rafi", "mohammad rafi", "rafi song"],
     "ap dhillon": ["ap dhillon", "ap", "dhillon", "ap song"],
-    "gurinder gill": ["gurinder gill", "gill", "gurinder song"],
+    "gurinder gill": ["gurinder gill", "gill", "gurinder song"],    "pawan singh": ["pawan singh", "power star pawan singh"],
+    "khesari lal yadav": ["khesari lal", "khesari lal yadav", "khesari"],
+    "shilpi raj": ["shilpi raj"],
+    "akshara singh": ["akshara singh"],
+    "ritesh pandey": ["ritesh pandey"],
+    "pramod premi yadav": ["pramod premi", "pramod premi yadav"],
+    "neelkamal singh": ["neelkamal singh"],
+    "arvind akela kallu": ["arvind akela kallu", "kallu"],
+    "dinesh lal yadav": ["dinesh lal yadav", "nirahua"],
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -199,6 +221,64 @@ TRENDING_STYLES = [
 # 🌍 DETECT LANGUAGE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
+def _word_or_phrase_present(value: str, key: str) -> bool:
+    value = str(value or "").lower()
+    key = str(key or "").lower().strip()
+    if not key:
+        return False
+
+    if " " in key:
+        return key in value
+
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])",
+        value,
+    ) is not None
+
+
+async def infer_track_language(title: str, vidid: str = "") -> str:
+    """
+    Infer the CURRENT/manual song language using py_yt metadata.
+    This avoids defaulting a Bhojpuri song to Hindi when its title does not
+    literally contain 'Bhojpuri'. Channel names like 'Hamaar Bhojpuri' help.
+    """
+    direct = detect_lang_signal(title)
+    if direct:
+        return direct
+
+    if not title:
+        return ""
+
+    try:
+        data = await VideosSearch(title, limit=5).next()
+        rows = data.get("result", []) or []
+
+        rows = sorted(
+            rows,
+            key=lambda item: 0 if vidid and item.get("id") == vidid else 1,
+        )
+
+        for item in rows:
+            combined = " ".join(
+                str(x or "")
+                for x in (
+                    item.get("title"),
+                    item.get("channel"),
+                    item.get("channelTitle"),
+                    item.get("uploader"),
+                )
+            )
+
+            detected = detect_lang_signal(combined)
+            if detected:
+                return detected
+    except Exception:
+        pass
+
+    return ""
+
+
 def detect_lang_signal(text_value):
     """
     Return an explicit language signal or "" when the text does not tell us.
@@ -212,14 +292,23 @@ def detect_lang_signal(text_value):
 
     # Artist signal is stronger than generic words.
     for artist, artist_lang in ARTIST_LANG.items():
-        if artist in value:
+        if _word_or_phrase_present(value, artist):
             return artist_lang
 
+    # Score language clues; avoid accidental substring matches.
+    scores = {}
     for lang, keys in LANG_DB.items():
-        if any(x in value for x in keys):
-            return lang
+        score = 0
+        for key in keys:
+            if _word_or_phrase_present(value, key):
+                score += 3 if " " in key else 1
+        if score:
+            scores[lang] = score
 
-    return ""
+    if not scores:
+        return ""
+
+    return max(scores, key=scores.get)
 
 
 def detect_lang(title):
@@ -1064,9 +1153,18 @@ async def auto_play_next(
         # language context even when the YouTube title contains no language word.
         previous_ctx = AUTOPLAY_CONTEXT.get(chat_id) or {}
         if last_vidid and previous_ctx.get("vidid") == last_vidid:
+            # Track already chosen by autoplay: preserve the locked language.
             lang = previous_ctx.get("lang") or detect_lang(last_title)
         else:
-            lang = detect_lang(last_title)
+            # Manual/current track: infer from title + py_yt channel metadata
+            # before falling back to Hindi.
+            inferred_lang = await infer_track_language(last_title, last_vidid)
+            lang = inferred_lang or detect_lang(last_title)
+
+        print(
+            f"🌐 Autoplay language detected: {lang} "
+            f"| current={last_title}"
+        )
 
         mood = detect_mood(last_title)
         artist = extract_artist(last_title)
