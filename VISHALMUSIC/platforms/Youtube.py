@@ -38,7 +38,7 @@ _formats_lock = asyncio.Lock()
 FAST_API_URL = os.getenv("API_URL", "").strip().rstrip("/")
 FAST_API_KEY = os.getenv("API_KEY", "")
 AUDIO_DIRECT_STREAM_MB = float(os.getenv("AUDIO_DIRECT_STREAM_MB", "20"))
-AUDIO_DIRECT_STREAM_BYTES = int(AUDIO_DIRECT_STREAM_MB * 1024 * 1024).strip()
+AUDIO_DIRECT_STREAM_BYTES = int(AUDIO_DIRECT_STREAM_MB * 1024 * 1024)
 
 # Existing Shruti API remains as fallback
 SHRUTI_API_KEY = "ShrutiBotspCO4qB3gMS2eDCpMeClO"
