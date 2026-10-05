@@ -181,11 +181,30 @@ async def get_fast_audio_stream(link: str) -> Optional[str]:
             return None
 
         stream_url = data.get("link")
-        if stream_url and stream_url.startswith("http"):
-            print("✅ Fast API direct audio stream ready")
+        stream_format = str(data.get("format") or "").lower().strip()
+
+        # Direct HTTP playback is very fast, but WebM/Opus streams have been
+        # intermittently entering a "playing but silent" state in Telegram VC.
+        # Keep the fast path only for M4A/MP4 audio. Other containers fall back
+        # to the local Fast-API download path below, which is slower to start
+        # but much more reliable.
+        direct_safe_formats = {"m4a", "mp4"}
+        if (
+            stream_url
+            and stream_url.startswith("http")
+            and stream_format in direct_safe_formats
+        ):
+            print(f"✅ Fast API direct audio stream ready ({stream_format})")
             return stream_url
 
-        print("⚠️ Fast API returned no valid stream URL")
+        if stream_url and stream_url.startswith("http"):
+            print(
+                f"⚠️ Fast API direct format '{stream_format or 'unknown'}' "
+                "is not VC-safe; using reliable local fallback"
+            )
+        else:
+            print("⚠️ Fast API returned no valid stream URL")
+
         return None
     except Exception as e:
         print(f"❌ Fast API stream error: {e}")
@@ -194,7 +213,13 @@ async def get_fast_audio_stream(link: str) -> Optional[str]:
 
 # ============ CUSTOM FAST API (PRIMARY AUDIO) ============
 async def download_song_fast_api(link: str) -> Optional[str]:
-    """Get best-audio URL from custom API, then download it locally."""
+    """
+    Fast local audio download using the custom API's signed media URL.
+
+    This deliberately downloads the complete audio before VC playback.
+    It avoids the intermittent "timer is moving but assistant is silent"
+    problem seen with remote HTTP playback.
+    """
     if not FAST_API_URL:
         return None
 
@@ -207,12 +232,27 @@ async def download_song_fast_api(link: str) -> Optional[str]:
         return None
 
     try:
-        print(f"⚡ Audio - Trying Fast API: {FAST_API_URL}")
-        timeout = aiohttp.ClientTimeout(total=120)
+        print(f"⚡ Audio - Fast local download via API: {FAST_API_URL}")
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
+        params = {"api_key": FAST_API_KEY} if FAST_API_KEY else {}
+        timeout = aiohttp.ClientTimeout(
+            total=180,
+            connect=10,
+            sock_connect=10,
+            sock_read=45,
+        )
+        connector = aiohttp.TCPConnector(
+            limit=20,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
 
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            read_bufsize=1024 * 1024,
+        ) as session:
+            # Step 1: get the signed media URL.
             async with session.get(
                 f"{FAST_API_URL}/song/{video_id}",
                 params=params,
@@ -221,48 +261,98 @@ async def download_song_fast_api(link: str) -> Optional[str]:
                     body = await response.text()
                     print(f"⚠️ Fast API returned {response.status}: {body[:250]}")
                     return None
+
                 data = await response.json(content_type=None)
 
             if data.get("status") != "done":
-                print(f"⚠️ Fast API extraction failed: {data.get('message', 'unknown error')}")
+                print(
+                    "⚠️ Fast API extraction failed: "
+                    f"{data.get('message', 'unknown error')}"
+                )
                 return None
 
             stream_url = data.get("link")
-            if not stream_url:
-                print("⚠️ Fast API returned no audio link")
+            if not stream_url or not str(stream_url).startswith("http"):
+                print("⚠️ Fast API returned no valid audio link")
                 return None
 
-            ext = str(data.get("format") or "webm").lower()
-            if ext not in {"webm", "m4a", "mp3", "opus", "ogg"}:
+            ext = str(data.get("format") or "").lower().strip().lstrip(".")
+            if ext not in {"webm", "m4a", "mp4", "mp3", "opus", "ogg"}:
                 ext = "webm"
 
             os.makedirs("downloads", exist_ok=True)
             file_path = os.path.join("downloads", f"{video_id}.{ext}")
+            temp_path = file_path + ".part"
 
+            # Instant cache hit for replay/autoplay repeats.
             if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
-                return file_path
-
-            async with session.get(stream_url, allow_redirects=True) as media:
-                if media.status not in (200, 206):
-                    print(f"⚠️ Fast API media URL returned status {media.status}")
-                    with contextlib.suppress(Exception):
-                        os.remove(file_path)
-                    return None
-
-                with open(file_path, "wb") as f:
-                    async for chunk in media.content.iter_chunked(262144):
-                        f.write(chunk)
-
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
-                print("✅ Audio downloaded via Fast API")
+                print("✅ Audio: local cache hit")
                 return file_path
 
             with contextlib.suppress(Exception):
-                os.remove(file_path)
-            return None
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+            # Step 2: pull the signed media as fast as the server/network allows.
+            headers = {
+                "Accept": "*/*",
+                "Accept-Encoding": "identity",
+                "Connection": "keep-alive",
+            }
+
+            started = time.monotonic()
+            async with session.get(
+                stream_url,
+                headers=headers,
+                allow_redirects=True,
+            ) as media:
+                if media.status not in (200, 206):
+                    print(
+                        "⚠️ Fast API media URL returned status "
+                        f"{media.status}"
+                    )
+                    return None
+
+                expected = media.content_length or 0
+                downloaded = 0
+
+                # 1 MiB chunks keep Python overhead low while still streaming
+                # efficiently to disk.
+                with open(temp_path, "wb", buffering=1024 * 1024) as f:
+                    async for chunk in media.content.iter_chunked(1024 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) <= 10240:
+                with contextlib.suppress(Exception):
+                    os.remove(temp_path)
+                print("⚠️ Downloaded audio file is too small")
+                return None
+
+            # If Content-Length was available, reject obviously truncated files.
+            if expected and downloaded < max(10240, int(expected * 0.97)):
+                with contextlib.suppress(Exception):
+                    os.remove(temp_path)
+                print(
+                    f"⚠️ Incomplete audio download: {downloaded}/{expected} bytes"
+                )
+                return None
+
+            os.replace(temp_path, file_path)
+
+            elapsed = max(time.monotonic() - started, 0.001)
+            mb = os.path.getsize(file_path) / (1024 * 1024)
+            speed = mb / elapsed
+            print(
+                f"✅ Audio downloaded locally: {mb:.1f} MB "
+                f"in {elapsed:.1f}s ({speed:.1f} MB/s)"
+            )
+            return file_path
 
     except Exception as e:
-        print(f"❌ Fast API error: {e}")
+        print(f"❌ Fast API local download error: {e}")
         return None
 
 
@@ -650,13 +740,8 @@ async def download_audio(link: str) -> str:
     result = await download_audio_ytdlp(link)
     if result:
         print("✅ Audio: yt-dlp Success")
-        if result.endswith('.webm'):
-            mp3_path = result.replace('.webm', '.mp3')
-            try:
-                shutil.move(result, mp3_path)
-                return mp3_path
-            except:
-                return result
+        # Keep the real container/extension. Renaming bytes without
+        # transcoding can confuse FFmpeg/PyTgCalls.
         return result
     
     print("❌ All audio download methods failed")
@@ -1076,28 +1161,14 @@ class YouTubeAPI:
                 return None, None
 
         else:
-            # Fastest path for VC playback: use the signed direct audio URL.
-            try:
-                stream_url = await get_fast_audio_stream(link)
-                if stream_url:
-                    print("✅ Audio: direct Fast API stream")
-                    return stream_url, None
-            except Exception as e:
-                print(f"❌ Fast API direct stream error: {str(e)}")
-
-            # Fallbacks below download the media locally.
+            # Reliability-first VC mode:
+            # Always download audio locally before playback. The custom Fast
+            # API still supplies the signed source URL, so this remains much
+            # faster than extracting/downloading with yt-dlp in most cases.
             try:
                 audio_result = await download_audio(link)
                 if audio_result:
-                    print("✅ Audio downloaded successfully")
-                    if audio_result.endswith('.mp3') and common_file_path.endswith('.webm'):
-                        mp3_path = audio_result
-                        webm_path = common_file_path
-                        try:
-                            shutil.move(mp3_path, webm_path)
-                            return webm_path, True
-                        except Exception:
-                            return audio_result, True
+                    print(f"✅ Audio ready from local file: {audio_result}")
                     return audio_result, True
             except Exception as e:
                 print(f"❌ Audio download error: {str(e)}")
