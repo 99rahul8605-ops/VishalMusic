@@ -21,6 +21,7 @@ autoplay_db = mongodb.autoplay
 
 RECENT = {}
 RECENT_TITLES = {}
+RECENT_MOVIES = {}
 AUTO_PLAYING = {}
 
 # Autoplay recommendation tuning
@@ -188,6 +189,27 @@ def detect_movie(title):
         if any(x in title for x in keys):
             return movie
     return ""
+
+
+def _remember_movie(chat_id: int, movie: str) -> None:
+    """Keep a short per-chat movie history so autoplay does not stick to one film."""
+    if not movie:
+        return
+
+    now = time.time()
+    rows = RECENT_MOVIES.setdefault(chat_id, [])
+    rows[:] = [(m, t) for m, t in rows if now - t < 3600]
+    rows.append((movie, now))
+
+    if len(rows) > 8:
+        RECENT_MOVIES[chat_id] = rows[-8:]
+
+
+def _recent_movies(chat_id: int):
+    now = time.time()
+    rows = RECENT_MOVIES.setdefault(chat_id, [])
+    rows[:] = [(m, t) for m, t in rows if now - t < 3600]
+    return [m for m, _ in rows[-4:]]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -408,57 +430,66 @@ async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY):
 
 def build_smart_queries(title, artist, movie, lang, mood):
     """
-    Build fewer, more specific searches.
+    Diversity-first autoplay search.
 
-    Avoid "jukebox", "playlist", "all songs" and other queries that naturally
-    return long compilations.
+    Important: do NOT search the current movie directly. Movie-specific queries
+    were the main reason autoplay kept choosing multiple songs from one film.
     """
     queries = []
     clean_title = normalize_title(title)
 
-    # Strongest context first.
-    if artist:
-        queries += [
-            f"{artist} popular songs official audio",
-            f"{artist} hit songs official",
-        ]
-
-    if movie:
-        queries += [
-            f"{movie} songs official audio",
-            f"{movie} soundtrack songs",
-        ]
-
-    # "Songs like ..." is useful when artist/movie metadata is missing.
-    # Same-song variants are hard-filtered later.
+    # Similar-song query first, but without forcing the same movie.
     if clean_title and len(clean_title) >= 4:
         queries += [
-            f"songs like {clean_title}",
-            f"{clean_title} similar {lang} songs",
+            f"songs like {clean_title} {lang}",
+            f"similar {lang} songs to {clean_title}",
         ]
 
-    if mood and mood != "normal":
-        queries.append(f"{mood} {lang} songs official audio")
+    # Same singer is useful, but only one artist query so autoplay does not get
+    # trapped in one soundtrack / one artist catalog.
+    if artist:
+        queries.append(f"{artist} popular songs official audio")
 
+    if mood and mood != "normal":
+        queries += [
+            f"{mood} {lang} songs official audio",
+            f"popular {mood} {lang} songs",
+        ]
+
+    # Broad language searches provide movie/artist diversity.
     if lang:
         queries += [
             f"popular {lang} songs official audio",
             f"{lang} hit songs official audio",
+            f"trending {lang} songs official audio",
         ]
 
     if lang == "hindi":
-        queries.append("bollywood hit songs official audio")
+        queries += [
+            "bollywood hit songs official audio",
+            "popular hindi songs official audio",
+        ]
+    elif lang == "marathi":
+        queries += [
+            "popular marathi songs official audio",
+            "marathi hit songs official audio",
+        ]
     elif lang == "punjabi":
-        queries.append("punjabi hit songs official audio")
+        queries += [
+            "punjabi hit songs official audio",
+            "popular punjabi songs official audio",
+        ]
 
-    # Deduplicate, preserve priority order, keep request count controlled.
     final = []
+    seen = set()
     for q in queries:
         q = re.sub(r"\s+", " ", q).strip()
-        if len(q) > 3 and q.lower() not in {x.lower() for x in final}:
+        key = q.lower()
+        if len(q) > 3 and key not in seen:
+            seen.add(key)
             final.append(q)
 
-    return final[:8]
+    return final[:9]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -472,6 +503,8 @@ async def get_best_song(chat_id, queries, last_title, last_vidid, artist, movie,
     """
     candidates = []
     original_norm = normalize_title(last_title)
+    current_movie = movie or detect_movie(last_title)
+    recent_movies = set(_recent_movies(chat_id))
 
     hard_bad_words = [
         "slowed", "reverb", "8d", "lofi", "lo-fi", "nightcore",
@@ -538,12 +571,15 @@ async def get_best_song(chat_id, queries, last_title, last_vidid, artist, movie,
 
                 score = query_bonus
 
-                # Query context bonus: if the search itself was artist/movie
+                # If a generic search somehow contains the current movie name,
+                # push it down instead of letting the same soundtrack dominate.
+                if current_movie and current_movie.lower() in q_lower:
+                    score -= 70
+
+                # Query context bonus: artist/language/mood only.
                 # specific, trust it more than broad trending searches.
                 if artist and artist.lower() in q_lower:
                     score += 30
-                if movie and movie.lower() in q_lower:
-                    score += 26
                 if mood != "normal" and mood.lower() in q_lower:
                     score += 10
                 if lang and lang.lower() in q_lower:
@@ -555,8 +591,14 @@ async def get_best_song(chat_id, queries, last_title, last_vidid, artist, movie,
                 ):
                     score += 70
 
-                if movie and movie.lower() in title_lower:
-                    score += 50
+                candidate_movie = detect_movie(raw_title)
+
+                # Do not immediately continue with another song from the same
+                # detected movie. Also avoid movies played very recently.
+                if current_movie and candidate_movie == current_movie:
+                    continue
+                if candidate_movie and candidate_movie in recent_movies:
+                    score -= 55
 
                 if mood != "normal":
                     mood_keys = MOOD_DB.get(mood, [])
@@ -703,6 +745,8 @@ async def auto_play_next(
         mood = detect_mood(last_title)
         artist = extract_artist(last_title)
         movie = detect_movie(last_title)
+        if movie:
+            _remember_movie(chat_id, movie)
 
         queries = build_smart_queries(last_title, artist, movie, lang, mood)
 
@@ -711,34 +755,37 @@ async def auto_play_next(
             chat_id, queries, last_title, last_vidid, artist, movie, mood, lang
         )
 
-        # Filtered fallback: still search normal single songs only.
+        # Diversity fallback: never search the current movie directly.
         if not vidid:
             fallback_queries = []
 
-            if artist:
-                fallback_queries.append(f"{artist} top songs official audio")
-
-            if movie:
-                fallback_queries.append(f"{movie} popular songs official audio")
-
             if mood and mood != "normal":
-                fallback_queries.append(f"{mood} {lang} hit songs")
+                fallback_queries.append(f"{mood} {lang} hit songs official audio")
 
             if lang:
                 fallback_queries += [
                     f"{lang} popular songs official audio",
                     f"{lang} chart songs official audio",
+                    f"trending {lang} songs official audio",
                 ]
+
+            if artist:
+                fallback_queries.append(f"{artist} best songs official audio")
 
             if lang == "hindi":
                 fallback_queries += [
                     "bollywood popular songs official audio",
                     "hindi chart songs official audio",
                 ]
+            elif lang == "marathi":
+                fallback_queries += [
+                    "popular marathi songs official audio",
+                    "marathi chart songs official audio",
+                ]
 
             vidid, details = await get_best_song(
                 chat_id,
-                fallback_queries[:6],
+                fallback_queries[:7],
                 last_title,
                 last_vidid,
                 artist,
@@ -756,6 +803,10 @@ async def auto_play_next(
 
         new_title = details.get("title", "") if details else ""
         await add_recent(chat_id, vidid, new_title)
+
+        new_movie = detect_movie(new_title)
+        if new_movie:
+            _remember_movie(chat_id, new_movie)
 
         link = f"https://youtube.com/watch?v={vidid}"
 
