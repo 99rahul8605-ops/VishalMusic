@@ -29,7 +29,7 @@ AUTOPLAY_CONTEXT = {}
 # Autoplay recommendation tuning
 AUTOPLAY_MIN_SECONDS = int(os.getenv("AUTOPLAY_MIN_SECONDS", "100"))
 AUTOPLAY_MAX_SECONDS = int(os.getenv("AUTOPLAY_MAX_SECONDS", "420"))
-AUTOPLAY_RESULTS_PER_QUERY = max(2, min(int(os.getenv("AUTOPLAY_RESULTS_PER_QUERY", "4")), 6))
+AUTOPLAY_RESULTS_PER_QUERY = max(4, min(int(os.getenv("AUTOPLAY_RESULTS_PER_QUERY", "6")), 8))
 AUTOPLAY_RECENT_LIMIT = max(20, min(int(os.getenv("AUTOPLAY_RECENT_LIMIT", "80")), 200))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -439,12 +439,14 @@ def _song_tokens(value: str):
 
 def _same_song(stored: str, candidate: str) -> bool:
     """
-    Strong duplicate matcher.
+    Conservative duplicate matcher.
 
-    It catches:
-      "Pal Pal - Afusic"
-      "AFUSIC - Pal Pal (Official Video)"
-    even though artist/title order is reversed.
+    Goal:
+      - block the same song from another upload/channel
+      - do NOT block different songs just because they share 1-2 words
+
+    Older matching was too aggressive and could exhaust the candidate pool,
+    causing "no relevant song found" after a few autoplay transitions.
     """
     if not stored or not candidate:
         return False
@@ -457,27 +459,28 @@ def _same_song(stored: str, candidate: str) -> bool:
     if a == b:
         return True
 
-    short = a if len(a) <= len(b) else b
-    long = b if len(a) <= len(b) else a
-    if len(short) >= 6 and (long.startswith(short) or short in long):
-        return True
-
     ta = set(_song_tokens(a))
     tb = set(_song_tokens(b))
+
     if ta and tb:
         common = ta & tb
         union = ta | tb
+        jaccard = len(common) / max(1, len(union))
 
-        # Two meaningful shared words with strong overlap is usually the same song.
-        if len(common) >= 2 and len(common) / max(1, len(union)) >= 0.55:
+        # Reordered title/artist or almost-identical upload names.
+        if len(common) >= 2 and jaccard >= 0.78:
             return True
 
-        # Exact token-set match catches reversed artist/title order.
-        if len(ta) >= 2 and ta == tb:
-            return True
+        # Same meaningful 3+ token phrase with only small extra decoration.
+        if min(len(ta), len(tb)) >= 3:
+            smaller = ta if len(ta) <= len(tb) else tb
+            larger = tb if len(ta) <= len(tb) else ta
+            if smaller.issubset(larger) and len(smaller) / max(1, len(larger)) >= 0.75:
+                return True
 
-    # Last guard for punctuation/order variants.
-    return SequenceMatcher(None, a, b).ratio() >= 0.82
+    # Very high textual similarity only. 0.90 avoids false positives like
+    # "Pal Pal" vs "Pal Pal Dil Ke Paas".
+    return SequenceMatcher(None, a, b).ratio() >= 0.90
 
 
 def reset_autoplay_session(chat_id: int) -> None:
@@ -695,39 +698,76 @@ async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY):
 #  SMART QUERY BUILDER (Indian Focus)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def build_smart_queries(title, artist, movie, lang, mood):
+def build_smart_queries(title, artist, movie, lang, mood, chat_id=None):
     """
-    Fast focused autoplay search.
+    Build a RELATED but diverse search set from the last song.
 
     Priority:
       1) same language
-      2) hit/popular
-      3) same singer = soft bonus
+      2) last-song singer/context
+      3) new/trending songs
       4) mood/category
+      5) variety so the same top few results do not keep returning
 
-    Maximum 4 searches. Older versions could make up to 9 sequential searches,
-    which added a large delay before the next song started.
+    All queries are still searched in parallel.
     """
-    queries = [
-        {"q": f"{lang} hit songs official audio", "kind": "hit"},
-        {"q": f"popular {lang} songs official audio", "kind": "hit"},
+    year = time.strftime("%Y")
+    recent_count = len(RECENT.get(chat_id, [])) if chat_id is not None else 0
+
+    # Rotate discovery wording every transition. This prevents the same static
+    # "top hits" query from returning the same 4-5 songs forever.
+    discovery_terms = [
+        "new release",
+        "trending",
+        "latest",
+        "fresh hits",
+        "popular new",
+        "chart",
     ]
+    d1 = discovery_terms[recent_count % len(discovery_terms)]
+    d2 = discovery_terms[(recent_count + 2) % len(discovery_terms)]
 
-    if mood and mood != "normal":
-        queries.append(
-            {"q": f"{lang} {mood} hit songs official audio", "kind": "mood_hit"}
-        )
+    queries = []
 
+    # Singer continuity is a preference, not a hard lock.
     if artist:
-        queries.append(
-            {"q": f"{lang} {artist} hit songs official audio", "kind": "artist"}
-        )
+        queries.append({
+            "q": f"{artist} {lang} {d1} songs {year} official audio",
+            "kind": "artist_new",
+        })
 
-    # If there is no mood/artist context, keep one chart-style search for variety.
-    if len(queries) < 3:
-        queries.append(
-            {"q": f"{lang} chart songs official audio", "kind": "language"}
-        )
+    # Mood/category continuity from the previous song.
+    if mood and mood != "normal":
+        queries.append({
+            "q": f"{lang} {mood} {d2} songs {year} official audio",
+            "kind": "mood_new",
+        })
+
+    # A context query ties language + singer + mood together when available.
+    context_bits = [lang]
+    if artist:
+        context_bits.append(artist)
+    if mood and mood != "normal":
+        context_bits.append(mood)
+    context_bits.append("similar songs")
+    context_bits.append("official audio")
+    queries.append({
+        "q": " ".join(context_bits),
+        "kind": "similar",
+    })
+
+    # Always include new/trending language-wide discovery so autoplay can move
+    # to another singer instead of getting stuck on one artist.
+    queries.extend([
+        {
+            "q": f"{lang} {d1} songs {year} official audio",
+            "kind": "new_hit",
+        },
+        {
+            "q": f"{lang} {d2} hit songs {year} official audio",
+            "kind": "trending",
+        },
+    ])
 
     final = []
     seen = set()
@@ -738,7 +778,9 @@ def build_smart_queries(title, artist, movie, lang, mood):
             seen.add(key)
             final.append({"q": q, "kind": item["kind"]})
 
-    return final[:4]
+    # 5 parallel searches × default 6 results gives a broad pool without
+    # serial delay.
+    return final[:5]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -788,8 +830,14 @@ async def get_ranked_songs(
     ]
 
     kind_bonus = {
-        "hit": 320,
-        "mood_hit": 280,
+        "artist_new": 380,
+        "mood_new": 350,
+        "similar": 330,
+        "new_hit": 340,
+        "trending": 320,
+        # Backward/fallback compatibility:
+        "hit": 280,
+        "mood_hit": 260,
         "artist": 180,
         "language": 120,
     }
@@ -921,19 +969,24 @@ async def get_ranked_songs(
                 # rejection above.
                 views = int(details.get("views") or 0)
                 if views >= 100_000_000:
-                    score += 260
+                    score += 170
                 elif views >= 50_000_000:
-                    score += 220
-                elif views >= 20_000_000:
-                    score += 180
-                elif views >= 10_000_000:
                     score += 150
+                elif views >= 20_000_000:
+                    score += 130
+                elif views >= 10_000_000:
+                    score += 115
                 elif views >= 5_000_000:
-                    score += 120
+                    score += 100
                 elif views >= 1_000_000:
-                    score += 90
+                    score += 80
                 elif views >= 250_000:
                     score += 45
+
+                # New/trending query pools get an explicit boost so autoplay
+                # does not keep preferring the same old mega-hits.
+                if kind in {"artist_new", "mood_new", "new_hit", "trending"}:
+                    score += 70
 
                 if any(x in title_lower for x in ["hit", "superhit", "popular"]):
                     score += 45
@@ -1105,7 +1158,7 @@ async def auto_play_next(
         # language context even when the YouTube title contains no language word.
         previous_ctx = AUTOPLAY_CONTEXT.get(chat_id) or {}
         if last_vidid and previous_ctx.get("vidid") == last_vidid:
-            # Track already chosen by autoplay: preserve the locked language.
+            # Track already chosen by autoplay: preserve recommendation context.
             lang = previous_ctx.get("lang") or detect_lang(last_title)
         else:
             # Manual/current track: infer from title + py_yt channel metadata
@@ -1120,11 +1173,20 @@ async def auto_play_next(
 
         mood = detect_mood(last_title)
         artist = extract_artist(last_title)
+
+        # If this is an autoplay-selected song, carry forward the known
+        # singer/mood when the title itself does not expose them cleanly.
+        if last_vidid and previous_ctx.get("vidid") == last_vidid:
+            if not artist:
+                artist = previous_ctx.get("artist") or ""
+            if mood == "normal":
+                mood = previous_ctx.get("mood") or "normal"
+
         movie = detect_movie(last_title)
         if movie:
             _remember_movie(chat_id, movie)
 
-        queries = build_smart_queries(last_title, artist, movie, lang, mood)
+        queries = build_smart_queries(last_title, artist, movie, lang, mood, chat_id=chat_id)
         search_started = time.monotonic()
 
         # IMPORTANT:
@@ -1150,9 +1212,12 @@ async def auto_play_next(
 
         if not ranked:
             # Final fallback is STILL same-language only.
+            year = time.strftime("%Y")
             fallback_queries = [
-                {"q": f"{lang} hit songs official audio", "kind": "hit"},
-                {"q": f"popular {lang} songs", "kind": "hit"},
+                {"q": f"{lang} new release songs {year} official audio", "kind": "new_hit"},
+                {"q": f"{lang} trending songs {year} official audio", "kind": "trending"},
+                {"q": f"{lang} popular songs official audio", "kind": "hit"},
+                {"q": f"{lang} fresh music official audio", "kind": "language"},
             ]
 
             ranked = await get_ranked_songs(
@@ -1164,7 +1229,7 @@ async def auto_play_next(
                 movie,
                 mood,
                 lang,
-                limit=3,
+                limit=5,
             )
 
         if not ranked:
@@ -1237,9 +1302,16 @@ async def auto_play_next(
                 if new_movie:
                     _remember_movie(chat_id, new_movie)
 
+                next_artist = extract_artist(new_title) or artist or ""
+                next_mood = detect_mood(new_title)
+                if next_mood == "normal":
+                    next_mood = mood or "normal"
+
                 AUTOPLAY_CONTEXT[chat_id] = {
                     "vidid": vidid,
                     "lang": lang,
+                    "artist": next_artist,
+                    "mood": next_mood,
                 }
 
                 last_stream_error = None
