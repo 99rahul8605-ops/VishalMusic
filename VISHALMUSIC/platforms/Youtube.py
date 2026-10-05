@@ -39,7 +39,8 @@ FAST_API_URL = os.getenv("API_URL", "").strip().rstrip("/")
 FAST_API_KEY = os.getenv("API_KEY", "")
 AUDIO_DIRECT_STREAM_MB = float(os.getenv("AUDIO_DIRECT_STREAM_MB", "20"))
 AUDIO_DIRECT_STREAM_BYTES = int(AUDIO_DIRECT_STREAM_MB * 1024 * 1024)
-AUDIO_DOWNLOAD_WORKERS = max(1, min(int(os.getenv("AUDIO_DOWNLOAD_WORKERS", "6")), 12))
+AUDIO_DOWNLOAD_WORKERS = max(1, min(int(os.getenv("AUDIO_DOWNLOAD_WORKERS", "3")), 12))
+AUDIO_DOWNLOAD_RETRIES = max(1, min(int(os.getenv("AUDIO_DOWNLOAD_RETRIES", "3")), 5))
 _audio_fast_locks = {}
 
 # Existing Shruti API remains as fallback
@@ -300,35 +301,61 @@ async def _download_media_parallel(
         end = min(total_size - 1, start + chunk_size - 1)
         expected = end - start + 1
 
-        headers = {
-            "Accept": "*/*",
-            "Accept-Encoding": "identity",
-            "Connection": "keep-alive",
-            "Range": f"bytes={start}-{end}",
-        }
+        last_error = None
 
-        async with session.get(
-            url,
-            headers=headers,
-            allow_redirects=True,
-        ) as r:
-            if r.status != 206:
-                raise RuntimeError(
-                    f"range {i} returned HTTP {r.status}, expected 206"
-                )
+        for attempt in range(1, AUDIO_DOWNLOAD_RETRIES + 1):
+            headers = {
+                "Accept": "*/*",
+                "Accept-Encoding": "identity",
+                "Connection": "keep-alive",
+                "Range": f"bytes={start}-{end}",
+            }
 
-            written = 0
-            with open(part_paths[i], "wb", buffering=1024 * 1024) as f:
-                async for chunk in r.content.iter_chunked(512 * 1024):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    written += len(chunk)
+            try:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    allow_redirects=True,
+                ) as r:
+                    if r.status != 206:
+                        raise RuntimeError(
+                            f"range {i} returned HTTP {r.status}, expected 206"
+                        )
 
-            if written != expected:
-                raise RuntimeError(
-                    f"range {i} incomplete: {written}/{expected} bytes"
-                )
+                    written = 0
+                    with open(part_paths[i], "wb", buffering=1024 * 1024) as f:
+                        async for chunk in r.content.iter_chunked(512 * 1024):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            written += len(chunk)
+
+                    if written == expected:
+                        return
+
+                    raise RuntimeError(
+                        f"range {i} incomplete: {written}/{expected} bytes"
+                    )
+
+            except (
+                aiohttp.ClientPayloadError,
+                aiohttp.ServerDisconnectedError,
+                ConnectionResetError,
+                asyncio.TimeoutError,
+                RuntimeError,
+            ) as e:
+                last_error = e
+                with contextlib.suppress(Exception):
+                    if os.path.exists(part_paths[i]):
+                        os.remove(part_paths[i])
+
+                if attempt < AUDIO_DOWNLOAD_RETRIES:
+                    await asyncio.sleep(0.25 * attempt)
+                    continue
+
+        raise RuntimeError(
+            f"range {i} failed after {AUDIO_DOWNLOAD_RETRIES} tries: {last_error}"
+        )
 
     try:
         await asyncio.gather(*(fetch_part(i) for i in range(workers)))
@@ -358,6 +385,111 @@ async def _download_media_parallel(
             with contextlib.suppress(Exception):
                 if os.path.exists(part):
                     os.remove(part)
+
+
+async def _download_media_resumable(
+    session: aiohttp.ClientSession,
+    url: str,
+    temp_path: str,
+    expected_size: int = 0,
+):
+    """
+    Single-stream fallback with resume.
+
+    If the CDN/VPS connection resets after e.g. 3,129,328 of 3,178,465 bytes,
+    keep the bytes already received and request only the missing tail instead
+    of abandoning Fast API immediately.
+    """
+    last_error = None
+    expected = int(expected_size or 0)
+
+    for attempt in range(1, AUDIO_DOWNLOAD_RETRIES + 1):
+        offset = 0
+        if os.path.exists(temp_path):
+            with contextlib.suppress(Exception):
+                offset = os.path.getsize(temp_path)
+
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive",
+        }
+        if offset > 0:
+            headers["Range"] = f"bytes={offset}-"
+
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                allow_redirects=True,
+            ) as media:
+                if media.status == 403:
+                    return False, 403, expected
+
+                if media.status not in (200, 206):
+                    return False, media.status, expected
+
+                # If server ignored Range and returned a full 200 response,
+                # restart the temp file instead of appending duplicate bytes.
+                if offset > 0 and media.status == 200:
+                    offset = 0
+                    with contextlib.suppress(Exception):
+                        os.remove(temp_path)
+
+                content_range = media.headers.get("Content-Range", "")
+                if "/" in content_range:
+                    total = content_range.rsplit("/", 1)[-1].strip()
+                    if total.isdigit():
+                        expected = int(total)
+                elif not expected and media.content_length:
+                    expected = int(media.content_length) + offset
+
+                mode = "ab" if offset > 0 and media.status == 206 else "wb"
+                with open(temp_path, mode, buffering=1024 * 1024) as f:
+                    async for chunk in media.content.iter_chunked(1024 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+
+            current = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+
+            if expected:
+                if current >= expected:
+                    return True, 200, expected
+                last_error = RuntimeError(
+                    f"incomplete payload: {current}/{expected} bytes"
+                )
+            elif current > 10240:
+                return True, 200, current
+
+        except (
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerDisconnectedError,
+            ConnectionResetError,
+            asyncio.TimeoutError,
+        ) as e:
+            last_error = e
+
+        current = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+        if attempt < AUDIO_DOWNLOAD_RETRIES:
+            if current:
+                print(
+                    f"↻ Media connection interrupted at "
+                    f"{current / (1024 * 1024):.2f} MB; "
+                    f"resuming ({attempt + 1}/{AUDIO_DOWNLOAD_RETRIES})..."
+                )
+            else:
+                print(
+                    f"↻ Media connection interrupted; retrying "
+                    f"({attempt + 1}/{AUDIO_DOWNLOAD_RETRIES})..."
+                )
+            await asyncio.sleep(0.35 * attempt)
+
+    print(
+        "⚠️ Media download incomplete after retries: "
+        f"{type(last_error).__name__ if last_error else 'unknown'}: {last_error}"
+    )
+    return False, 0, expected
 
 
 async def download_song_fast_api(link: str) -> Optional[str]:
@@ -501,36 +633,31 @@ async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[s
             if parallel_ok:
                 downloaded = os.path.getsize(temp_path)
             else:
-                # Fallback for servers that ignore Range headers or unknown size.
-                async with session.get(
+                # Resumable fallback: transient CDN/VPS connection resets no
+                # longer send us straight to Shruti/yt-dlp.
+                ok, media_status, resumed_expected = await _download_media_resumable(
+                    session,
                     stream_url,
-                    headers=headers,
-                    allow_redirects=True,
-                ) as media:
-                    if media.status not in (200, 206):
+                    temp_path,
+                    expected,
+                )
+                if not ok:
+                    if media_status:
                         print(
                             "⚠️ Fast API media URL returned status "
-                            f"{media.status}"
+                            f"{media_status}"
                         )
-                        return None
+                    return None
 
-                    expected = media.content_length or remote_size or 0
+                if resumed_expected:
+                    expected = resumed_expected
+                downloaded = os.path.getsize(temp_path)
 
-                    # A size may only become known on this GET.
-                    if expected and expected > AUDIO_DIRECT_STREAM_BYTES:
-                        expected_mb = expected / (1024 * 1024)
-                        print(
-                            f"🚀 Large audio {expected_mb:.1f} MB > "
-                            f"{AUDIO_DIRECT_STREAM_MB:g} MB: using direct stream"
-                        )
-                        return stream_url
-
-                    with open(temp_path, "wb", buffering=1024 * 1024) as f:
-                        async for chunk in media.content.iter_chunked(1024 * 1024):
-                            if not chunk:
-                                continue
-                            f.write(chunk)
-                            downloaded += len(chunk)
+                # A size may only become known while downloading.
+                if expected and expected > AUDIO_DIRECT_STREAM_BYTES:
+                    # We already have a partial/full local file here, so keep it
+                    # rather than throwing it away for a direct stream.
+                    pass
 
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) <= 10240:
                 with contextlib.suppress(Exception):

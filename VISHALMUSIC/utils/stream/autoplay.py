@@ -3,6 +3,7 @@ import os
 import random
 import re
 import time
+from difflib import SequenceMatcher
 
 import aiohttp
 from py_yt import VideosSearch
@@ -14,6 +15,7 @@ from VISHALMUSIC.platforms.Youtube import YouTubeAPI
 
 yt = YouTubeAPI()
 autoplay_db = mongodb.autoplay
+autoplay_history_db = mongodb.autoplay_history
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  PROTECTION SYSTEM
@@ -28,6 +30,8 @@ AUTO_PLAYING = {}
 AUTOPLAY_MIN_SECONDS = int(os.getenv("AUTOPLAY_MIN_SECONDS", "100"))
 AUTOPLAY_MAX_SECONDS = int(os.getenv("AUTOPLAY_MAX_SECONDS", "420"))
 AUTOPLAY_RESULTS_PER_QUERY = max(2, min(int(os.getenv("AUTOPLAY_RESULTS_PER_QUERY", "5")), 8))
+AUTOPLAY_REPEAT_HOURS = max(2, int(os.getenv("AUTOPLAY_REPEAT_HOURS", "12")))
+AUTOPLAY_RECENT_LIMIT = max(20, min(int(os.getenv("AUTOPLAY_RECENT_LIMIT", "80")), 200))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🇮🇳 INDIAN LANGUAGE DATABASE
@@ -247,20 +251,149 @@ def normalize_title(title: str) -> str:
     return t
 
 
+def _song_tokens(value: str):
+    stop = {
+        "official", "video", "audio", "lyrics", "lyrical", "song", "music",
+        "full", "hd", "hq", "4k", "new", "latest", "movie", "film",
+        "records", "record", "label", "topic", "vevo", "original",
+        "version", "feat", "ft", "from",
+    }
+    value = normalize_title(value)
+    return [
+        x for x in re.findall(r"[a-z0-9]+", value)
+        if len(x) > 1 and x not in stop
+    ]
+
+
 def _same_song(stored: str, candidate: str) -> bool:
     """
-    Fuzzy title match — handles cases where one has extra words.
-    e.g. stored="diwaniyat", candidate="diwaniyat ap dhillon shreya ghoshal"
-    Both start with "diwaniyat" so they match.
+    Strong duplicate matcher.
+
+    It catches:
+      "Pal Pal - Afusic"
+      "AFUSIC - Pal Pal (Official Video)"
+    even though artist/title order is reversed.
     """
     if not stored or not candidate:
         return False
-    if len(stored) < 4 or len(candidate) < 4:
+
+    a = normalize_title(stored)
+    b = normalize_title(candidate)
+    if len(a) < 4 or len(b) < 4:
         return False
-    short = stored if len(stored) <= len(candidate) else candidate
-    long  = candidate if len(stored) <= len(candidate) else stored
-    # Match if the longer one starts with the shorter, or shorter is a substring
-    return long.startswith(short) or short in long
+
+    if a == b:
+        return True
+
+    short = a if len(a) <= len(b) else b
+    long = b if len(a) <= len(b) else a
+    if len(short) >= 6 and (long.startswith(short) or short in long):
+        return True
+
+    ta = set(_song_tokens(a))
+    tb = set(_song_tokens(b))
+    if ta and tb:
+        common = ta & tb
+        union = ta | tb
+
+        # Two meaningful shared words with strong overlap is usually the same song.
+        if len(common) >= 2 and len(common) / max(1, len(union)) >= 0.55:
+            return True
+
+        # Exact token-set match catches reversed artist/title order.
+        if len(ta) >= 2 and ta == tb:
+            return True
+
+    # Last guard for punctuation/order variants.
+    return SequenceMatcher(None, a, b).ratio() >= 0.82
+
+
+async def _load_persistent_recent(chat_id: int) -> None:
+    """
+    Restore recent autoplay history from Mongo so restarting/updating the bot
+    does not immediately allow the same songs again.
+    """
+    try:
+        doc = await autoplay_history_db.find_one({"chat_id": chat_id}) or {}
+        rows = doc.get("songs", []) or []
+        now = time.time()
+        max_age = AUTOPLAY_REPEAT_HOURS * 3600
+
+        ids = []
+        titles = []
+        clean_rows = []
+
+        for row in rows[-AUTOPLAY_RECENT_LIMIT:]:
+            try:
+                ts = float(row.get("ts", 0))
+            except Exception:
+                ts = 0
+
+            if not ts or now - ts > max_age:
+                continue
+
+            vidid = str(row.get("vidid") or "").strip()
+            title = str(row.get("title") or "").strip()
+
+            if vidid:
+                ids.append((vidid, ts))
+            if title:
+                norm = normalize_title(title)
+                if norm:
+                    titles.append((norm, ts))
+
+            clean_rows.append(
+                {"vidid": vidid, "title": title, "ts": ts}
+            )
+
+        RECENT[chat_id] = ids[-AUTOPLAY_RECENT_LIMIT:]
+        RECENT_TITLES[chat_id] = titles[-AUTOPLAY_RECENT_LIMIT:]
+
+        # Opportunistically prune old DB entries.
+        if len(clean_rows) != len(rows):
+            await autoplay_history_db.update_one(
+                {"chat_id": chat_id},
+                {"$set": {"songs": clean_rows[-AUTOPLAY_RECENT_LIMIT:]}},
+                upsert=True,
+            )
+    except Exception:
+        # In-memory repeat protection still works if Mongo has a temporary issue.
+        pass
+
+
+async def _persist_recent_song(chat_id: int, vidid: str, title: str) -> None:
+    try:
+        doc = await autoplay_history_db.find_one({"chat_id": chat_id}) or {}
+        rows = doc.get("songs", []) or []
+        now = time.time()
+        max_age = AUTOPLAY_REPEAT_HOURS * 3600
+
+        fresh = []
+        for row in rows:
+            try:
+                ts = float(row.get("ts", 0))
+            except Exception:
+                ts = 0
+            if ts and now - ts <= max_age:
+                fresh.append(row)
+
+        # Avoid writing the same exact video twice back-to-back.
+        if not fresh or str(fresh[-1].get("vidid") or "") != str(vidid):
+            fresh.append(
+                {
+                    "vidid": str(vidid or ""),
+                    "title": str(title or ""),
+                    "ts": now,
+                }
+            )
+
+        await autoplay_history_db.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"songs": fresh[-AUTOPLAY_RECENT_LIMIT:]}},
+            upsert=True,
+        )
+    except Exception:
+        pass
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -273,7 +406,7 @@ async def is_repeat(chat_id, vidid, title: str = "") -> bool:
     # vidid-based check
     if chat_id not in RECENT:
         RECENT[chat_id] = []
-    RECENT[chat_id] = [(v, t) for v, t in RECENT[chat_id] if current - t < 7200]
+    RECENT[chat_id] = [(v, t) for v, t in RECENT[chat_id] if current - t < AUTOPLAY_REPEAT_HOURS * 3600]
     if vidid in [v for v, _ in RECENT[chat_id]]:
         return True
 
@@ -284,7 +417,7 @@ async def is_repeat(chat_id, vidid, title: str = "") -> bool:
             if chat_id not in RECENT_TITLES:
                 RECENT_TITLES[chat_id] = []
             RECENT_TITLES[chat_id] = [
-                (n, t) for n, t in RECENT_TITLES[chat_id] if current - t < 7200
+                (n, t) for n, t in RECENT_TITLES[chat_id] if current - t < AUTOPLAY_REPEAT_HOURS * 3600
             ]
             for stored_norm, _ in RECENT_TITLES[chat_id]:
                 if _same_song(stored_norm, norm):
@@ -305,8 +438,8 @@ async def add_recent(chat_id, vidid, title: str = "") -> None:
     if chat_id not in RECENT:
         RECENT[chat_id] = []
     RECENT[chat_id].append((vidid, current))
-    if len(RECENT[chat_id]) > 50:
-        RECENT[chat_id] = RECENT[chat_id][-50:]
+    if len(RECENT[chat_id]) > AUTOPLAY_RECENT_LIMIT:
+        RECENT[chat_id] = RECENT[chat_id][-AUTOPLAY_RECENT_LIMIT:]
 
     if title:
         norm = normalize_title(title)
@@ -314,8 +447,10 @@ async def add_recent(chat_id, vidid, title: str = "") -> None:
             if chat_id not in RECENT_TITLES:
                 RECENT_TITLES[chat_id] = []
             RECENT_TITLES[chat_id].append((norm, current))
-            if len(RECENT_TITLES[chat_id]) > 50:
-                RECENT_TITLES[chat_id] = RECENT_TITLES[chat_id][-50:]
+            if len(RECENT_TITLES[chat_id]) > AUTOPLAY_RECENT_LIMIT:
+                RECENT_TITLES[chat_id] = RECENT_TITLES[chat_id][-AUTOPLAY_RECENT_LIMIT:]
+
+    await _persist_recent_song(chat_id, vidid, title)
 
 
 
@@ -718,6 +853,9 @@ async def auto_play_next(
         data = await autoplay_db.find_one({"chat_id": chat_id})
         if not data or not data.get("status"):
             return False
+
+        # Restore history first so bot restarts/deploys do not reset repeat protection.
+        await _load_persistent_recent(chat_id)
 
         # FIX 1: Mark last played song as recent BEFORE searching
         # Pass title too so same song from different channels is blocked
