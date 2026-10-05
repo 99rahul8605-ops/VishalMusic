@@ -39,6 +39,8 @@ FAST_API_URL = os.getenv("API_URL", "").strip().rstrip("/")
 FAST_API_KEY = os.getenv("API_KEY", "")
 AUDIO_DIRECT_STREAM_MB = float(os.getenv("AUDIO_DIRECT_STREAM_MB", "20"))
 AUDIO_DIRECT_STREAM_BYTES = int(AUDIO_DIRECT_STREAM_MB * 1024 * 1024)
+AUDIO_DOWNLOAD_WORKERS = max(1, min(int(os.getenv("AUDIO_DOWNLOAD_WORKERS", "6")), 12))
+_audio_fast_locks = {}
 
 # Existing Shruti API remains as fallback
 SHRUTI_API_KEY = "ShrutiBotspCO4qB3gMS2eDCpMeClO"
@@ -155,14 +157,6 @@ async def get_fast_audio_stream(link: str) -> Optional[str]:
     if not FAST_API_URL:
         return None
 
-    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
-    if "youtu.be/" in video_id:
-        video_id = video_id.split("youtu.be/")[-1].split("?")[0]
-    video_id = video_id.strip()
-
-    if not video_id or len(video_id) < 3:
-        return None
-
     try:
         print(f"⚡ Audio - Getting direct stream from Fast API: {FAST_API_URL}")
         timeout = aiohttp.ClientTimeout(total=30)
@@ -217,35 +211,30 @@ async def get_fast_audio_stream(link: str) -> Optional[str]:
 
 # ============ CUSTOM FAST API (PRIMARY AUDIO) ============
 
+def _get_audio_fast_lock(video_id: str) -> asyncio.Lock:
+    lock = _audio_fast_locks.get(video_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _audio_fast_locks[video_id] = lock
+    return lock
+
+
 async def _remote_media_size(session: aiohttp.ClientSession, url: str) -> int:
     """
-    Best-effort remote size probe without downloading the whole song.
-    Returns total bytes, or 0 when the server does not expose a reliable size.
+    Get a reliable total size without downloading the file.
+
+    Range probing is preferred over HEAD because YouTube/CDN signed URLs can
+    report misleading Content-Length values on HEAD.
     """
-    headers = {
+    base_headers = {
         "Accept": "*/*",
         "Accept-Encoding": "identity",
         "Connection": "keep-alive",
     }
 
-    # HEAD is cheapest when supported.
-    try:
-        async with session.head(
-            url,
-            headers=headers,
-            allow_redirects=True,
-        ) as r:
-            if r.status < 400:
-                value = r.headers.get("Content-Length")
-                if value and value.isdigit():
-                    return int(value)
-    except Exception:
-        pass
-
-    # Some signed media hosts do not support HEAD. Ask only for byte 0 and
-    # read the total from Content-Range: bytes 0-0/TOTAL.
-    range_headers = dict(headers)
+    range_headers = dict(base_headers)
     range_headers["Range"] = "bytes=0-0"
+
     try:
         async with session.get(
             url,
@@ -253,7 +242,7 @@ async def _remote_media_size(session: aiohttp.ClientSession, url: str) -> int:
             allow_redirects=True,
         ) as r:
             content_range = r.headers.get("Content-Range", "")
-            if "/" in content_range:
+            if r.status == 206 and "/" in content_range:
                 total = content_range.rsplit("/", 1)[-1].strip()
                 if total.isdigit():
                     return int(total)
@@ -264,10 +253,130 @@ async def _remote_media_size(session: aiohttp.ClientSession, url: str) -> int:
     except Exception:
         pass
 
+    try:
+        async with session.head(
+            url,
+            headers=base_headers,
+            allow_redirects=True,
+        ) as r:
+            if r.status < 400:
+                value = r.headers.get("Content-Length")
+                if value and value.isdigit():
+                    return int(value)
+    except Exception:
+        pass
+
     return 0
 
 
+async def _download_media_parallel(
+    session: aiohttp.ClientSession,
+    url: str,
+    total_size: int,
+    temp_path: str,
+) -> bool:
+    """
+    Download a known-size media file with parallel byte ranges.
+
+    YouTube media hosts usually support HTTP ranges. Multiple concurrent
+    ranges avoid the very slow single-connection throttling that can make a
+    5 MB track take minutes.
+    """
+    if total_size <= 0:
+        return False
+
+    workers = min(AUDIO_DOWNLOAD_WORKERS, max(1, total_size // (512 * 1024)))
+    workers = max(1, workers)
+
+    # A single worker offers no advantage over the normal fallback path.
+    if workers <= 1:
+        return False
+
+    chunk_size = (total_size + workers - 1) // workers
+    part_paths = [f"{temp_path}.p{i}" for i in range(workers)]
+
+    async def fetch_part(i: int):
+        start = i * chunk_size
+        end = min(total_size - 1, start + chunk_size - 1)
+        expected = end - start + 1
+
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive",
+            "Range": f"bytes={start}-{end}",
+        }
+
+        async with session.get(
+            url,
+            headers=headers,
+            allow_redirects=True,
+        ) as r:
+            if r.status != 206:
+                raise RuntimeError(
+                    f"range {i} returned HTTP {r.status}, expected 206"
+                )
+
+            written = 0
+            with open(part_paths[i], "wb", buffering=1024 * 1024) as f:
+                async for chunk in r.content.iter_chunked(512 * 1024):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    written += len(chunk)
+
+            if written != expected:
+                raise RuntimeError(
+                    f"range {i} incomplete: {written}/{expected} bytes"
+                )
+
+    try:
+        await asyncio.gather(*(fetch_part(i) for i in range(workers)))
+
+        with open(temp_path, "wb", buffering=1024 * 1024) as out:
+            for part in part_paths:
+                with open(part, "rb") as inp:
+                    shutil.copyfileobj(inp, out, length=1024 * 1024)
+
+        final_size = os.path.getsize(temp_path)
+        if final_size != total_size:
+            raise RuntimeError(
+                f"combined range file incomplete: {final_size}/{total_size}"
+            )
+
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Parallel range download failed: {type(e).__name__}: {e}")
+        with contextlib.suppress(Exception):
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        return False
+
+    finally:
+        for part in part_paths:
+            with contextlib.suppress(Exception):
+                if os.path.exists(part):
+                    os.remove(part)
+
+
 async def download_song_fast_api(link: str) -> Optional[str]:
+    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
+    if "youtu.be/" in video_id:
+        video_id = video_id.split("youtu.be/")[-1].split("?")[0]
+    video_id = video_id.strip()
+
+    if not video_id or len(video_id) < 3:
+        return None
+
+    # The same track can reach download() twice during queue/autoplay races.
+    # Serialize by video id so we do not download the same 5 MB file twice.
+    lock = _get_audio_fast_lock(video_id)
+    async with lock:
+        return await _download_song_fast_api_locked(link, video_id)
+
+
+async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[str]:
     """
     Hybrid fast-audio mode:
 
@@ -298,7 +407,7 @@ async def download_song_fast_api(link: str) -> Optional[str]:
             sock_read=45,
         )
         connector = aiohttp.TCPConnector(
-            limit=20,
+            limit=max(20, AUDIO_DOWNLOAD_WORKERS + 4),
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
         )
@@ -372,36 +481,56 @@ async def download_song_fast_api(link: str) -> Optional[str]:
             }
 
             started = time.monotonic()
-            async with session.get(
-                stream_url,
-                headers=headers,
-                allow_redirects=True,
-            ) as media:
-                if media.status not in (200, 206):
-                    print(
-                        "⚠️ Fast API media URL returned status "
-                        f"{media.status}"
-                    )
-                    return None
+            downloaded = 0
+            expected = remote_size or 0
 
-                expected = media.content_length or remote_size or 0
+            # Known small files: parallel byte ranges first. This is the main
+            # speed path for CDN URLs that throttle each individual connection.
+            parallel_ok = False
+            if expected and expected <= AUDIO_DIRECT_STREAM_BYTES:
+                print(
+                    f"⚡ Parallel local download: {AUDIO_DOWNLOAD_WORKERS} workers"
+                )
+                parallel_ok = await _download_media_parallel(
+                    session,
+                    stream_url,
+                    expected,
+                    temp_path,
+                )
 
-                # A size may only become known on this GET.
-                if expected and expected > AUDIO_DIRECT_STREAM_BYTES:
-                    expected_mb = expected / (1024 * 1024)
-                    print(
-                        f"🚀 Large audio {expected_mb:.1f} MB > "
-                        f"{AUDIO_DIRECT_STREAM_MB:g} MB: using direct stream"
-                    )
-                    return stream_url
+            if parallel_ok:
+                downloaded = os.path.getsize(temp_path)
+            else:
+                # Fallback for servers that ignore Range headers or unknown size.
+                async with session.get(
+                    stream_url,
+                    headers=headers,
+                    allow_redirects=True,
+                ) as media:
+                    if media.status not in (200, 206):
+                        print(
+                            "⚠️ Fast API media URL returned status "
+                            f"{media.status}"
+                        )
+                        return None
 
-                downloaded = 0
-                with open(temp_path, "wb", buffering=1024 * 1024) as f:
-                    async for chunk in media.content.iter_chunked(1024 * 1024):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
+                    expected = media.content_length or remote_size or 0
+
+                    # A size may only become known on this GET.
+                    if expected and expected > AUDIO_DIRECT_STREAM_BYTES:
+                        expected_mb = expected / (1024 * 1024)
+                        print(
+                            f"🚀 Large audio {expected_mb:.1f} MB > "
+                            f"{AUDIO_DIRECT_STREAM_MB:g} MB: using direct stream"
+                        )
+                        return stream_url
+
+                    with open(temp_path, "wb", buffering=1024 * 1024) as f:
+                        async for chunk in media.content.iter_chunked(1024 * 1024):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
 
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) <= 10240:
                 with contextlib.suppress(Exception):
@@ -424,7 +553,7 @@ async def download_song_fast_api(link: str) -> Optional[str]:
             speed = mb / elapsed
             print(
                 f"✅ Audio downloaded locally: {mb:.1f} MB "
-                f"in {elapsed:.1f}s ({speed:.1f} MB/s)"
+                f"in {elapsed:.1f}s ({speed:.2f} MB/s)"
             )
             return file_path
 
