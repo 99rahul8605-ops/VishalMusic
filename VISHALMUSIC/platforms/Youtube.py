@@ -510,12 +510,17 @@ async def download_song_fast_api(link: str) -> Optional[str]:
 
 async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[str]:
     """
-    Fast API proxy-stream mode.
+    Fast API -> local-file mode.
 
-    We still stream immediately (no full local download), but PyTgCalls/FFmpeg
-    connects to our API /audio endpoint instead of directly to googlevideo.
-    This avoids the recurring "timer moves but no voice" / raw signed-URL issue
-    and also lets the API refresh a media URL on upstream 403.
+    Same reliable playback style as the old working bot:
+        API sends audio bytes -> bot saves local file -> PyTgCalls plays file
+
+    Important:
+    - No size probe.
+    - No parallel range workers.
+    - No raw googlevideo URL is given to the bot.
+    - No remote HTTP URL is given to PyTgCalls.
+    - Range is used only if an interrupted API transfer needs to resume.
     """
     if not FAST_API_URL:
         return None
@@ -528,53 +533,178 @@ async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[s
     if not video_id or len(video_id) < 3:
         return None
 
-    try:
-        print(f"⚡ Audio - Fast API proxy stream mode: {FAST_API_URL}")
+    os.makedirs("downloads", exist_ok=True)
 
-        params = {}
-        if FAST_API_KEY:
-            params["api_key"] = FAST_API_KEY
+    cached = _find_cached_audio(video_id)
+    if cached:
+        print(f"✅ Fast API local cache: {cached}")
+        return cached
 
-        # Preflight /song once. This preserves the existing fallback chain if
-        # extraction itself fails, and it warms the short API song cache so
-        # /audio can begin streaming immediately.
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=25,
+    temp_path = os.path.join("downloads", f"{video_id}.fast.part")
+    selected_ext = None
+    expected_total = 0
+    started = time.monotonic()
+    last_error = None
+
+    # First request is a simple direct download, just like the old /download API.
+    # Extra attempts are only for broken connections.
+    for attempt in range(1, 4):
+        try:
+            offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+
+            params = {}
+            if FAST_API_KEY:
+                params["api_key"] = FAST_API_KEY
+
+            # On a later retry, also force a fresh source extraction if needed.
+            if attempt > 1:
+                params["fresh"] = 1
+
+            headers = {
+                "Accept": "*/*",
+                "Accept-Encoding": "identity",
+                "Connection": "keep-alive",
+            }
+            if offset > 0:
+                headers["Range"] = f"bytes={offset}-"
+
+            print(
+                f"⚡ Audio - Fast API local download"
+                f"{' resume' if offset else ''}: {FAST_API_URL}"
+            )
+
+            timeout = aiohttp.ClientTimeout(
+                total=120,
                 connect=8,
                 sock_connect=8,
-                sock_read=18,
+                sock_read=35,
             )
-        ) as session:
-            async with session.get(
-                f"{FAST_API_URL}/song/{video_id}",
-                params=params,
-            ) as response:
-                data = await response.json(content_type=None)
 
-                if response.status != 200 or data.get("status") != "done":
-                    print(
-                        f"⚠️ Fast API song extraction failed: "
-                        f"{response.status} {str(data)[:220]}"
-                    )
-                    return None
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{FAST_API_URL}/download/{video_id}",
+                    params=params,
+                    headers=headers,
+                    allow_redirects=True,
+                ) as response:
+                    if response.status not in (200, 206):
+                        body = await response.text()
+                        print(
+                            f"⚠️ Fast API download returned {response.status}: "
+                            f"{body[:220]}"
+                        )
+                        last_error = RuntimeError(
+                            f"Fast API download status {response.status}"
+                        )
+                        await asyncio.sleep(0.25 * attempt)
+                        continue
 
-        proxy_url = f"{FAST_API_URL}/audio/{video_id}"
-        if FAST_API_KEY:
-            proxy_url += f"?api_key={FAST_API_KEY}"
+                    ext = (
+                        response.headers.get("X-Audio-Ext")
+                        or "m4a"
+                    ).lower().strip(".")
+                    if ext not in {"m4a", "mp4", "webm", "opus", "ogg", "mp3"}:
+                        ext = "m4a"
 
-        print("🚀 Audio proxy stream ready")
-        return proxy_url
+                    # If a retry unexpectedly switches container, restart clean.
+                    if selected_ext and ext != selected_ext and offset > 0:
+                        with contextlib.suppress(Exception):
+                            os.remove(temp_path)
+                        selected_ext = ext
+                        expected_total = 0
+                        await asyncio.sleep(0.1)
+                        continue
 
-    except asyncio.TimeoutError:
-        print("❌ Fast API proxy stream timeout")
-        return None
-    except Exception as e:
-        print(
-            f"❌ Fast API proxy stream error: "
-            f"{type(e).__name__}: {e!r}"
-        )
-        return None
+                    selected_ext = ext
+
+                    # If the API ignored our Range request and sent 200,
+                    # restart the partial file instead of duplicating bytes.
+                    if offset > 0 and response.status == 200:
+                        offset = 0
+                        with contextlib.suppress(Exception):
+                            os.remove(temp_path)
+
+                    content_range = response.headers.get("Content-Range", "")
+                    if "/" in content_range:
+                        total = content_range.rsplit("/", 1)[-1].strip()
+                        if total.isdigit():
+                            expected_total = int(total)
+                    elif response.content_length:
+                        expected_total = int(response.content_length) + offset
+
+                    mode = "ab" if offset > 0 and response.status == 206 else "wb"
+
+                    with open(temp_path, mode, buffering=1024 * 1024) as fh:
+                        async for chunk in response.content.iter_chunked(128 * 1024):
+                            if chunk:
+                                fh.write(chunk)
+
+            current = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+
+            if current < 10240:
+                last_error = RuntimeError(
+                    f"Downloaded file too small: {current} bytes"
+                )
+                continue
+
+            if expected_total and current < expected_total:
+                last_error = RuntimeError(
+                    f"Incomplete API download: {current}/{expected_total}"
+                )
+                print(
+                    f"↻ API transfer incomplete at "
+                    f"{current / 1024 / 1024:.2f} MB; retrying..."
+                )
+                continue
+
+            final_ext = selected_ext or "m4a"
+            final_path = os.path.join(
+                "downloads",
+                f"{video_id}.{final_ext}",
+            )
+
+            os.replace(temp_path, final_path)
+
+            elapsed = max(0.001, time.monotonic() - started)
+            mb = os.path.getsize(final_path) / (1024 * 1024)
+            print(
+                f"✅ Fast API local audio: {mb:.1f} MB in "
+                f"{elapsed:.1f}s ({mb / elapsed:.2f} MB/s)"
+            )
+            return final_path
+
+        except (
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerDisconnectedError,
+            ConnectionResetError,
+            asyncio.TimeoutError,
+        ) as e:
+            last_error = e
+            current = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+            print(
+                f"↻ Fast API transfer interrupted at "
+                f"{current / 1024 / 1024:.2f} MB "
+                f"({attempt}/3): {type(e).__name__}"
+            )
+            await asyncio.sleep(0.3 * attempt)
+
+        except Exception as e:
+            last_error = e
+            print(
+                f"❌ Fast API local download error: "
+                f"{type(e).__name__}: {e}"
+            )
+            await asyncio.sleep(0.25 * attempt)
+
+    print(
+        "❌ Fast API local download failed: "
+        f"{type(last_error).__name__ if last_error else 'unknown'}: "
+        f"{last_error}"
+    )
+    with contextlib.suppress(Exception):
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    return None
 
 
 async def download_song_primary_api(link: str) -> str:
@@ -1594,18 +1724,17 @@ class YouTubeAPI:
                 return None, None
 
         else:
-            # Fast-start stable VC mode:
-            # Successful Fast API audio streams through the API proxy. No full
-            # local download; fallback methods remain available if API fails.
+            # Stable local-file VC mode:
+            # Fast API sends audio bytes quickly; bot saves the completed file
+            # locally, then the original PyTgCalls MediaStream plays that file.
             try:
                 audio_result = await download_audio(link)
                 if audio_result:
                     if str(audio_result).startswith(("http://", "https://")):
-                        print("🚀 Audio ready as API proxy stream")
-                        return audio_result, None
-
-                    print(f"✅ Audio fallback ready from local file: {audio_result}")
-                    return audio_result, True
+                        print("⚠️ Unexpected remote audio URL; refusing VC direct stream")
+                    else:
+                        print(f"✅ Audio ready from local file: {audio_result}")
+                        return audio_result, True
             except Exception as e:
                 print(f"❌ Audio download error: {type(e).__name__}: {e!r}")
             
