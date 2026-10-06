@@ -37,6 +37,11 @@ AUTOPLAY_RECENT_LIMIT = max(20, min(int(os.getenv("AUTOPLAY_RECENT_LIMIT", "80")
 # Mongo me history kitni der yaad rakhni hai (bot restart ke baad bhi repeat na ho).
 AUTOPLAY_HISTORY_TTL = int(float(os.getenv("AUTOPLAY_HISTORY_TTL_HOURS", "3")) * 3600)
 LOADED_HISTORY = set()
+# Pool exhaust hone par history poori saaf nahi hoti; sirf itne SABSE RECENT songs
+# block rehte hain (purane wapas aa sakte hain, haal ke nahi).
+AUTOPLAY_KEEP_ON_EXHAUST = max(0, int(os.getenv("AUTOPLAY_KEEP_ON_EXHAUST", "15")))
+# Debug: pichle search me kis wajah se kitne candidates reject hue.
+LAST_REJECTS = {}
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🇮🇳 INDIAN LANGUAGE DATABASE
@@ -1105,6 +1110,7 @@ async def get_ranked_songs(
     limit=3,
     era="",
     strict_artist=True,
+    strict_lang=True,
 ):
     """
     Return already-selected/ranked song candidates.
@@ -1160,6 +1166,11 @@ async def get_ranked_songs(
     # Search all focused queries concurrently. This is the main speed fix:
     # 3-4 py_yt searches now take roughly the time of the slowest one instead
     # of their times adding together.
+    stats = {}
+
+    def _rej(reason):
+        stats[reason] = stats.get(reason, 0) + 1
+
     prepared_queries = []
     search_tasks = []
 
@@ -1189,12 +1200,15 @@ async def get_ranked_songs(
         zip(prepared_queries, search_results)
     ):
         if isinstance(rows, Exception):
+            stats["search_error"] = stats.get("search_error", 0) + 1
             rows = []
+        stats["raw_results"] = stats.get("raw_results", 0) + len(rows)
 
         for result_index, details in enumerate(rows):
             try:
                 vidid = details.get("vidid") or details.get("id") or ""
                 if not vidid or vidid in seen_vids or vidid == last_vidid:
+                    _rej("duplicate_or_current")
                     continue
                 seen_vids.add(vidid)
 
@@ -1206,26 +1220,32 @@ async def get_ranked_songs(
                 secs = duration_to_seconds(duration)
 
                 if not raw_title or not norm_title:
+                    _rej("empty_title")
                     continue
 
                 if _HARD_BAD_RE.search(title_lower):
+                    _rej("bad_word(remix/cover/jukebox..)")
                     continue
 
                 if await is_repeat(chat_id, vidid, raw_title):
+                    _rej("already_played(repeat)")
                     continue
 
                 if vidid in queued_vids or any(
                     _same_song(qt, norm_title) for qt in queued_titles
                 ):
+                    _rej("already_in_queue")
                     continue
 
                 if original_norm and _same_song(original_norm, norm_title):
+                    _rej("same_as_current_song")
                     continue
 
                 if secs and (
                     secs < AUTOPLAY_MIN_SECONDS
                     or secs > AUTOPLAY_MAX_SECONDS
                 ):
+                    _rej("duration_out_of_range")
                     continue
 
                 combined = f"{raw_title} {channel}".lower()
@@ -1234,6 +1254,7 @@ async def get_ranked_songs(
                 # (views unknown = 0 to reject nahi karte.)
                 cand_views = int(details.get("views") or 0)
                 if strict_artist and cand_views and cand_views < min_views:
+                    _rej("low_views")
                     continue
 
                 # ERA GUARD: old song ke baad new song nahi.
@@ -1245,8 +1266,10 @@ async def get_ranked_songs(
                 title_year = _year_in_title(raw_title)
                 if era == "old":
                     if title_year and title_year >= 2015 and strict_artist:
+                        _rej("era_new_title_year")
                         continue
                     if strict_artist and cand_age is not None and cand_age < 3:
+                        _rej("era_too_new")
                         continue
 
                 # PRIORITY #1 — LANGUAGE
@@ -1255,10 +1278,16 @@ async def get_ranked_songs(
                 # language-specific search query instead of falsely rejecting it.
                 candidate_lang = detect_lang_signal(combined)
                 if candidate_lang and candidate_lang != lang:
-                    continue
+                    if strict_lang:
+                        _rej(f"wrong_language({candidate_lang}!={lang})")
+                        continue
+                    lang_penalty = 300
+                else:
+                    lang_penalty = 0
 
                 score = 1000  # same-language search pool
                 score += kind_bonus.get(kind, 100)
+                score -= lang_penalty
 
                 # CATEGORY GUARD — sad ke baad bhajan/shaadi/party jaisa jump
                 # nahi. Devotional/wedding hard-block, baaki soft penalty.
@@ -1278,6 +1307,7 @@ async def get_ranked_songs(
                         # False) me sirf bhaari penalty, taaki autoplay kabhi
                         # "no song" hoke VC band na kare.
                         if hard and strict_artist:
+                            _rej(f"category_jump({candidate_mood} vs {mood})")
                             continue
                         score -= 300 if hard else 140
 
@@ -1314,6 +1344,7 @@ async def get_ranked_songs(
                         # Ek hi singer 2 baar lagatar baj chuka -> variety.
                         if artist_streak >= AUTOPLAY_MAX_SAME_ARTIST:
                             if strict_artist:
+                                _rej("same_singer_cap")
                                 continue
                             score -= 220
                     else:
@@ -1410,9 +1441,12 @@ async def get_ranked_songs(
                 details["_mood_match"] = mood_match
                 candidates.append((score, vidid, details))
 
-            except Exception:
+            except Exception as e:
+                _rej(f"error:{type(e).__name__}:{e}")
                 continue
 
+    stats["accepted"] = len(candidates)
+    LAST_REJECTS[chat_id] = stats
 
     candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -1654,11 +1688,49 @@ async def auto_play_next(
             )
 
         if not ranked:
+            # Stage 3: history/pool exhaust ho gaya ho sakta hai -> is chat ki
+            # history saaf karke (current song rakhke) dobara try.
+            print(
+                f"⚠️ Autoplay [{chat_id}] fallback khali. rejects="
+                f"{LAST_REJECTS.get(chat_id)} -> purani history trim karke retry"
+            )
+            # Pehle sirf sabse purane songs hatao (haal ke 15 block rehte hain).
+            # Phir bhi khali ho to 5, aur aakhir me sirf current song block.
+            for keep in (AUTOPLAY_KEEP_ON_EXHAUST, 5, 0):
+                RECENT[chat_id] = RECENT.get(chat_id, [])[-keep:] if keep else []
+                RECENT_TITLES[chat_id] = (
+                    RECENT_TITLES.get(chat_id, [])[-keep:] if keep else []
+                )
+                if last_vidid:
+                    await add_recent(chat_id, last_vidid, last_title)
+                ranked = await get_ranked_songs(
+                    chat_id, fallback_queries + queries, last_title, last_vidid,
+                    artist, movie, mood, lang,
+                    limit=5, era=era, strict_artist=False,
+                )
+                if ranked:
+                    print(f"♻️ Autoplay [{chat_id}] history trim: sirf last {keep} block rakhe")
+                    break
+
+        if not ranked:
+            # Stage 4: aakhri koshish — language rule bhi naram (penalty), taaki
+            # "no relevant song" se VC band na ho.
+            print(
+                f"⚠️ Autoplay [{chat_id}] retry bhi khali. rejects="
+                f"{LAST_REJECTS.get(chat_id)} -> language relax"
+            )
+            ranked = await get_ranked_songs(
+                chat_id, fallback_queries + queries, last_title, last_vidid,
+                artist, movie, mood, lang,
+                limit=5, era=era, strict_artist=False, strict_lang=False,
+            )
+
+        if not ranked:
             try:
                 await msg.edit_text("❌ ɴᴏ ʀᴇʟᴇᴠᴀɴᴛ ꜱᴏɴɢ ꜰᴏᴜɴᴅ")
             except Exception:
                 pass
-            print(f"⛔ Autoplay False [{chat_id}]: search me koi candidate nahi bacha (lang={lang}, artist={artist or '-'}, mood={mood}, era={era or '-'})")
+            print(f"⛔ Autoplay False [{chat_id}]: search me koi candidate nahi bacha (lang={lang}, artist={artist or '-'}, mood={mood}, era={era or '-'}) rejects={LAST_REJECTS.get(chat_id)}")
             return False
 
         language = await get_lang(chat_id)
