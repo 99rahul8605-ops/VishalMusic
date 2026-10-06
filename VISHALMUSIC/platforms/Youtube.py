@@ -556,10 +556,6 @@ async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[s
             if FAST_API_KEY:
                 params["api_key"] = FAST_API_KEY
 
-            # On a later retry, also force a fresh source extraction if needed.
-            if attempt > 1:
-                params["fresh"] = 1
-
             headers = {
                 "Accept": "*/*",
                 "Accept-Encoding": "identity",
@@ -569,15 +565,15 @@ async def _download_song_fast_api_locked(link: str, video_id: str) -> Optional[s
                 headers["Range"] = f"bytes={offset}-"
 
             print(
-                f"⚡ Audio - Fast API local download"
+                f"⚡ Audio - Fast API cached local download"
                 f"{' resume' if offset else ''}: {FAST_API_URL}"
             )
 
             timeout = aiohttp.ClientTimeout(
-                total=120,
+                total=180,
                 connect=8,
                 sock_connect=8,
-                sock_read=35,
+                sock_read=90,
             )
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
