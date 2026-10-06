@@ -321,7 +321,8 @@ LANG_TOP_ARTISTS = {
     "haryanvi": ["masoom sharma", "khasa aala chahar", "renuka panwar"],
     "english": ["ed sheeran", "the weeknd", "dua lipa", "justin bieber"],
 }
-OLD_DISCOVERY_TERMS = ["evergreen", "superhit", "classic", "golden hits", "old is gold", "90s hits"]
+# "hits/superhit/golden/best" jaise words jukebox-compilation laate hain -> avoid.
+OLD_DISCOVERY_TERMS = ["romantic", "90s", "film", "evergreen", "melody", "soulful"]
 
 # Ye words akele language decide nahi karenge (Hindi songs me bhi aate hain).
 WEAK_LANG_KEYS = {
@@ -1147,6 +1148,13 @@ async def get_ranked_songs(
 
     seen_vids = set()
 
+    # Purane film songs aksar 6-9 min ke hote hain; fallback me aur relax.
+    min_secs = AUTOPLAY_MIN_SECONDS if strict_artist else 60
+    max_secs = AUTOPLAY_MAX_SECONDS + (180 if era == "old" else 0)
+    if not strict_artist:
+        max_secs = max(max_secs, 720)
+    search_limit = AUTOPLAY_RESULTS_PER_QUERY if strict_artist else 12
+
     # Queue me jo songs already line me hain wo bhi repeat na ho.
     queued_vids, queued_titles = set(), []
     for q_item in (db.get(chat_id) or []):
@@ -1186,7 +1194,7 @@ async def get_ranked_songs(
             continue
 
         prepared_queries.append((q, kind))
-        search_tasks.append(search_many(q))
+        search_tasks.append(search_many(q, search_limit))
 
     if search_tasks:
         search_results = await asyncio.gather(
@@ -1241,10 +1249,7 @@ async def get_ranked_songs(
                     _rej("same_as_current_song")
                     continue
 
-                if secs and (
-                    secs < AUTOPLAY_MIN_SECONDS
-                    or secs > AUTOPLAY_MAX_SECONDS
-                ):
+                if secs and (secs < min_secs or secs > max_secs):
                     _rej("duration_out_of_range")
                     continue
 
@@ -1661,9 +1666,10 @@ async def auto_play_next(
             year = time.strftime("%Y")
             if era == "old":
                 fallback_queries = [
-                    {"q": f"{lang} old classic songs official audio", "kind": "new_hit"},
-                    {"q": f"{lang} evergreen superhit songs official audio", "kind": "trending"},
-                    {"q": f"{lang} 90s hit songs official audio", "kind": "hit"},
+                    {"q": f"{lang} old classic song official audio", "kind": "new_hit"},
+                    {"q": f"{lang} 90s romantic song official audio", "kind": "trending"},
+                    {"q": f"{lang} old film song official audio", "kind": "hit"},
+                    {"q": f"{lang} purane gaane official audio", "kind": "language"},
                 ]
             else:
                 fallback_queries = [
