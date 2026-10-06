@@ -37,9 +37,12 @@ AUTOPLAY_RECENT_LIMIT = max(20, min(int(os.getenv("AUTOPLAY_RECENT_LIMIT", "80")
 # Mongo me history kitni der yaad rakhni hai (bot restart ke baad bhi repeat na ho).
 AUTOPLAY_HISTORY_TTL = int(float(os.getenv("AUTOPLAY_HISTORY_TTL_HOURS", "3")) * 3600)
 LOADED_HISTORY = set()
-# Pool exhaust hone par history poori saaf nahi hoti; sirf itne SABSE RECENT songs
-# block rehte hain (purane wapas aa sakte hain, haal ke nahi).
-AUTOPLAY_KEEP_ON_EXHAUST = max(0, int(os.getenv("AUTOPLAY_KEEP_ON_EXHAUST", "15")))
+# Mongo me history persist (restart ke baad bhi repeat na ho). "0" = pure
+# in-memory, sirf current VC session.
+AUTOPLAY_PERSIST_HISTORY = os.getenv("AUTOPLAY_PERSIST_HISTORY", "1").lower() not in {"0", "false", "no", "off"}
+# "1" = bhajan/shaadi/party jaise category-jump har pass me hard-block (last resort me bhi).
+AUTOPLAY_STRICT_CATEGORY = os.getenv("AUTOPLAY_STRICT_CATEGORY", "0").lower() in {"1", "true", "yes", "on"}
+SEARCH_ERRORS = {}
 # Debug: pichle search me kis wajah se kitne candidates reject hue.
 LAST_REJECTS = {}
 
@@ -309,6 +312,18 @@ OLD_ERA_ARTISTS = {
     "kishore kumar", "lata mangeshkar", "mohammad rafi", "asha bhosle",
     "mukesh", "manna dey", "kumar sanu", "alka yagnik", "udit narayan",
 }
+# Golden-age singers: inke songs 2015+ ke seed ke saath kabhi nahi jayenge.
+GOLDEN_ARTISTS = {
+    "kishore kumar", "lata mangeshkar", "mohammad rafi", "asha bhosle",
+    "mukesh", "manna dey",
+}
+# 90s ke singers jo aaj bhi gaate hain -> sirf tab "old" jab seed ki umar pata na ho / purani ho.
+NINETIES_ARTISTS = {"kumar sanu", "alka yagnik", "udit narayan"}
+# Seed 2000s ka ho (umar < 25 saal) to golden-age ki jagah ye singers.
+MID_OLD_TOP_ARTISTS = [
+    "sonu nigam", "shreya ghoshal", "kk", "shaan", "sunidhi chauhan",
+    "udit narayan", "alka yagnik", "kumar sanu",
+]
 OLD_TOP_ARTISTS = [
     "kishore kumar", "mohammad rafi", "lata mangeshkar", "kumar sanu",
     "udit narayan", "alka yagnik", "asha bhosle", "mukesh",
@@ -412,16 +427,23 @@ def _year_in_title(title: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _related_pool(artist: str, lang: str, era: str = ""):
+def _related_pool(artist: str, lang: str, era: str = "", seed_age=None):
     """Related singers; unknown singer ho to language/era ke popular singers."""
     a = (artist or "").lower()
     pool = list(RELATED_ARTISTS.get(a, []))
     if not pool:
         if era == "old" and lang == "hindi":
-            pool = list(OLD_TOP_ARTISTS)
+            younger = seed_age is not None and seed_age < 25
+            pool = list(MID_OLD_TOP_ARTISTS if younger else OLD_TOP_ARTISTS)
         else:
             pool = list(LANG_TOP_ARTISTS.get(lang, []))
     return [x for x in pool if x != a]
+
+
+def _decade_label(year: int) -> str:
+    """1994 -> "90s", 2008 -> "2000s", 2013 -> "2010s"."""
+    d = (int(year) // 10) * 10
+    return f"{d % 100}s" if d < 2000 else f"{d}s"
 
 
 def _artist_from_rows(rows, vidid: str = "") -> str:
@@ -722,6 +744,8 @@ async def _load_history(chat_id: int) -> None:
     Bot restart ke baad Mongo se recent songs/singers wapas load karo.
     Har chat ke liye sirf ek baar. TTL se purani history ignore hoti hai.
     """
+    if not AUTOPLAY_PERSIST_HISTORY:
+        return
     if chat_id in LOADED_HISTORY:
         return
     LOADED_HISTORY.add(chat_id)
@@ -765,6 +789,8 @@ async def _load_history(chat_id: int) -> None:
 
 
 async def _save_history(chat_id: int) -> None:
+    if not AUTOPLAY_PERSIST_HISTORY:
+        return
     try:
         await history_db.update_one(
             {"chat_id": chat_id},
@@ -800,12 +826,13 @@ def reset_autoplay_session(chat_id: int) -> None:
     LOADED_HISTORY.discard(chat_id)
     # Real VC stop = naya session -> Mongo history bhi saaf. (Bot crash/restart
     # me ye function nahi chalta, isliye wahan history bachi rehti hai.)
-    try:
-        asyncio.get_running_loop().create_task(
-            history_db.delete_one({"chat_id": chat_id})
-        )
-    except Exception:
-        pass
+    if AUTOPLAY_PERSIST_HISTORY:
+        try:
+            asyncio.get_running_loop().create_task(
+                history_db.delete_one({"chat_id": chat_id})
+            )
+        except Exception:
+            pass
     print(f"🧹 Autoplay session history cleared: {chat_id}")
 
 
@@ -965,41 +992,117 @@ def parse_view_count(value) -> int:
     return int(number * mult)
 
 
-async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY):
-    """
-    Candidate search only.
+def _search_row(item: dict, query: str) -> dict:
+    return {
+        "title": item.get("title", "") or "",
+        "vidid": item.get("id") or "",
+        "duration_min": item.get("duration") or "0:00",
+        "thumb": _thumb_from_item(item),
+        "channel": _channel_name(item),
+        "age_years": _age_years(item),
+        "views": parse_view_count(
+            item.get("viewCount") or item.get("views") or item.get("view_count")
+        ),
+        "_search_query": query,
+    }
 
-    IMPORTANT: this function does NOT call the Fast audio API. Autoplay first
-    searches + ranks songs using py_yt, chooses the final candidate, and only
-    then stream() asks Youtube.py/Fast API for that selected video's audio.
+
+async def _search_ytdlp(query: str, limit: int):
+    """
+    Backup scraper: py_yt fail/khali ho to yt-dlp ka ytsearch (agar installed).
+    Sirf search metadata leta hai; audio abhi bhi stream() ke through aata hai.
+    """
+    try:
+        import yt_dlp
+    except Exception:
+        return []
+
+    def _run():
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        return (info or {}).get("entries") or []
+
+    loop = asyncio.get_running_loop()
+    entries = await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=12)
+
+    rows = []
+    for e in entries[:limit]:
+        vid = (e or {}).get("id") or ""
+        if not vid:
+            continue
+        secs = int(e.get("duration") or 0)
+        rows.append({
+            "title": e.get("title") or "",
+            "vidid": vid,
+            "duration_min": f"{secs // 60}:{secs % 60:02d}" if secs else "0:00",
+            "thumb": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "age_years": None,
+            "views": int(e.get("view_count") or 0),
+            "_search_query": query,
+        })
+    return rows
+
+
+async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY, pages: int = 1):
+    """
+    Candidate search only (Fast audio API yahan call nahi hoti).
+
+    - py_yt 2 baar try (pehli fail pe 0.4s ruk ke).
+    - Phir bhi khali/fail ho to yt-dlp backup.
+    - Fail hone par error SEARCH_ERRORS me jata hai aur console me print hota hai
+      (pehle `except: pass` se chup-chap khali list aati thi).
     """
     results = []
+    err = None
 
-    try:
-        data = await VideosSearch(query, limit=limit).next()
-        for item in (data.get("result", []) or [])[:limit]:
-            vidid = item.get("id") or ""
-            if not vidid:
-                continue
+    for attempt in (1, 2):
+        try:
+            vs = VideosSearch(query, limit=limit)
+            batches = [await vs.next()]
+            for _ in range(max(0, pages - 1)):
+                try:
+                    batches.append(await vs.next())
+                except Exception:
+                    break
 
-            results.append(
-                {
-                    "title": item.get("title", "") or "",
-                    "vidid": vidid,
-                    "duration_min": item.get("duration") or "0:00",
-                    "thumb": _thumb_from_item(item),
-                    "channel": _channel_name(item),
-                    "age_years": _age_years(item),
-                    "views": parse_view_count(
-                        item.get("viewCount")
-                        or item.get("views")
-                        or item.get("view_count")
-                    ),
-                    "_search_query": query,
-                }
-            )
-    except Exception:
-        pass
+            for data in batches:
+                for item in (data.get("result", []) or [])[:limit]:
+                    try:
+                        row = _search_row(item, query)
+                        if row["vidid"]:
+                            results.append(row)
+                    except Exception:
+                        continue  # ek kharab item poori search na bigade
+
+            if results:
+                err = None
+                break
+            err = "py_yt: 0 results"
+        except Exception as e:
+            err = f"py_yt {type(e).__name__}: {e}"
+
+        if attempt == 1:
+            await asyncio.sleep(0.4)
+
+    if not results:
+        try:
+            results = await _search_ytdlp(query, limit)
+            if results:
+                print(f"🛟 yt-dlp backup search used for [{query}] ({err})")
+                err = None
+        except Exception as e:
+            err = f"{err} | yt_dlp {type(e).__name__}: {e}"
+
+    if not results:
+        SEARCH_ERRORS[query] = err or "0 results"
+        print(f"⚠️ Search failed [{query}]: {err}")
 
     return results
 
@@ -1008,7 +1111,7 @@ async def search_many(query: str, limit: int = AUTOPLAY_RESULTS_PER_QUERY):
 #  SMART QUERY BUILDER (Indian Focus)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def build_smart_queries(title, artist, movie, lang, mood, chat_id=None, era=""):
+def build_smart_queries(title, artist, movie, lang, mood, chat_id=None, era="", seed_age=None):
     """
     Priority: language > mood/era > singer > related singers.
 
@@ -1022,21 +1125,42 @@ def build_smart_queries(title, artist, movie, lang, mood, chat_id=None, era=""):
     recent_count = len(RECENT.get(chat_id, [])) if chat_id is not None else 0
     old = era == "old"
 
-    terms = OLD_DISCOVERY_TERMS if old else [
-        "new release", "trending", "latest", "fresh hits", "popular new", "chart",
-    ]
+    # Seed song kis saal ka hai -> queries usi daur ke paas rakho.
+    year_i = int(year)
+    seed_year = (year_i - round(seed_age)) if seed_age is not None else None
+    decade = _decade_label(seed_year) if (old and seed_year) else ""
+    mid = (not old) and seed_age is not None and seed_age >= 3
+
+    if old:
+        terms = ["romantic", decade or "evergreen", "film", "melody", "soulful", "classic"]
+    elif mid:
+        terms = ["popular", "trending", "soulful", "romantic", "chart", "melody"]
+    else:
+        terms = ["new release", "trending", "latest", "fresh hits", "popular new", "chart"]
     d1 = terms[recent_count % len(terms)]
     d2 = terms[(recent_count + 2) % len(terms)]
 
     has_mood = bool(mood and mood != "normal")
     mood_phrase = MOOD_QUERY.get(mood, mood) if has_mood else ""
-    if old and "old" not in mood_phrase:
-        mood_phrase = f"{mood_phrase} old classic".strip()
-    yr = "" if (old or (has_mood and mood in NO_YEAR_MOODS)) else f" {year}"
+    if old:
+        if mood == "oldschool" and decade:
+            mood_phrase = decade
+        elif decade:
+            mood_phrase = f"{mood_phrase} {decade}".strip()
+        elif "old" not in mood_phrase:
+            mood_phrase = f"{mood_phrase} old classic".strip()
+
+    if old or (has_mood and mood in NO_YEAR_MOODS):
+        yr = ""
+    elif mid:
+        # seed ke saal ke aas-paas (seed-1, seed, seed+1 ghoomte hue).
+        yr = f" {min(year_i, seed_year + (recent_count % 3) - 1)}"
+    else:
+        yr = f" {year}"
 
     streak = _artist_streak(chat_id, artist) if (chat_id is not None and artist) else 0
     capped = streak >= AUTOPLAY_MAX_SAME_ARTIST
-    related = _related_pool(artist, lang, era)
+    related = _related_pool(artist, lang, era, seed_age)
     rot = (lambda n: related[(recent_count + n) % len(related)]) if related else None
 
     queries = []
@@ -1095,6 +1219,53 @@ def build_smart_queries(title, artist, movie, lang, mood, chat_id=None, era=""):
     return final[:5]
 
 
+def build_broad_queries(chat_id, artist, lang, mood, era, seed_age=None):
+    """
+    Pool khatam hone par WIDER search: history clear nahi hoti, language strict
+    rehti hai. Sirf query variety badhti hai: related singers, same-family
+    moods, pichle saal/decade.
+    """
+    year = int(time.strftime("%Y"))
+    old = era == "old"
+
+    if mood and mood != "normal":
+        moods = sorted(MOOD_COMPAT.get(mood, {mood}))
+        phrases = [MOOD_QUERY.get(m, m) for m in moods][:3]
+    else:
+        phrases = [""]
+
+    qs = []
+    for r in _related_pool(artist, lang, era, seed_age)[:4]:
+        qs.append({"q": f"{r} {lang} songs official audio", "kind": "related_artist"})
+
+    seed_year = (year - round(seed_age)) if seed_age is not None else None
+    if old:
+        if seed_year:
+            decs = [_decade_label(seed_year), _decade_label(seed_year + 10), _decade_label(seed_year - 10)]
+        else:
+            decs = ["80s", "90s", "2000s"]
+        for dec in decs:
+            for ph in phrases[:2]:
+                qs.append({"q": f"{lang} {dec} {ph} song official audio", "kind": "mood_new"})
+    else:
+        if seed_year and seed_age >= 3:
+            years = [seed_year, seed_year + 1, seed_year - 1, seed_year + 2, seed_year - 2]
+            years = [y for y in years if y <= year]
+        else:
+            years = [year, year - 1, year - 2]
+        for y in years:
+            for ph in phrases[:2]:
+                qs.append({"q": f"{lang} {ph} songs {y} official audio", "kind": "mood_new"})
+
+    final, seen = [], set()
+    for item in qs:
+        q = re.sub(r"\s+", " ", item["q"]).strip()
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            final.append({"q": q, "kind": item["kind"]})
+    return final[:10]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🎵 BEST SONG FINDER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1112,6 +1283,8 @@ async def get_ranked_songs(
     era="",
     strict_artist=True,
     strict_lang=True,
+    deep=False,
+    seed_age=None,
 ):
     """
     Return already-selected/ranked song candidates.
@@ -1153,7 +1326,8 @@ async def get_ranked_songs(
     max_secs = AUTOPLAY_MAX_SECONDS + (180 if era == "old" else 0)
     if not strict_artist:
         max_secs = max(max_secs, 720)
-    search_limit = AUTOPLAY_RESULTS_PER_QUERY if strict_artist else 12
+    search_limit = 15 if deep else (AUTOPLAY_RESULTS_PER_QUERY if strict_artist else 12)
+    search_pages = 2 if deep else 1
 
     # Queue me jo songs already line me hain wo bhi repeat na ho.
     queued_vids, queued_titles = set(), []
@@ -1166,7 +1340,7 @@ async def get_ranked_songs(
                 queued_titles.append(qt)
 
     artist_streak = _artist_streak(chat_id, artist) if artist else 0
-    related_names = _related_pool(artist, lang, era)
+    related_names = _related_pool(artist, lang, era, seed_age)
     min_views = (
         AUTOPLAY_MIN_VIEWS // 3 if lang in REGIONAL_LANGS else AUTOPLAY_MIN_VIEWS
     )
@@ -1194,7 +1368,7 @@ async def get_ranked_songs(
             continue
 
         prepared_queries.append((q, kind))
-        search_tasks.append(search_many(q, search_limit))
+        search_tasks.append(search_many(q, search_limit, search_pages))
 
     if search_tasks:
         search_results = await asyncio.gather(
@@ -1203,6 +1377,12 @@ async def get_ranked_songs(
         )
     else:
         search_results = []
+
+    # Search fail hua ho to wajah stats me (console me dikhegi).
+    for q_, _k in prepared_queries:
+        if q_ in SEARCH_ERRORS:
+            stats["search_failed"] = stats.get("search_failed", 0) + 1
+            stats["last_search_error"] = SEARCH_ERRORS.pop(q_)
 
     for query_index, ((q, kind), rows) in enumerate(
         zip(prepared_queries, search_results)
@@ -1269,6 +1449,8 @@ async def get_ranked_songs(
                 if "topic" in channel:
                     cand_age = None
                 title_year = _year_in_title(raw_title)
+                if title_year:
+                    cand_age = int(time.strftime("%Y")) - title_year
                 if era == "old":
                     if title_year and title_year >= 2015 and strict_artist:
                         _rej("era_new_title_year")
@@ -1311,7 +1493,7 @@ async def get_ranked_songs(
                         # Strict pass me hard-block. Fallback pass (strict_artist
                         # False) me sirf bhaari penalty, taaki autoplay kabhi
                         # "no song" hoke VC band na kare.
-                        if hard and strict_artist:
+                        if hard and (strict_artist or AUTOPLAY_STRICT_CATEGORY):
                             _rej(f"category_jump({candidate_mood} vs {mood})")
                             continue
                         score -= 300 if hard else 140
@@ -1321,21 +1503,57 @@ async def get_ranked_songs(
                 score += max(0, 35 - query_index * 4 - result_index * 3)
 
                 # Same singer is only a soft preference, not a requirement.
-                # Era scoring
+                # Era scoring: seed ki umar ke paas wale songs ko tarjeeh.
+                # (Pehle sirf old/new tha, isliye 2019-20 seed pe purane songs aate the.)
                 if era == "old":
                     if title_year and title_year >= 2015:
                         score -= 200
                     if cand_age is not None and cand_age < 8:
                         score -= 150
-                    elif cand_age is not None and cand_age >= 10:
+                    elif cand_age is not None and cand_age >= 10 and seed_age is None:
                         score += 60
+                    if seed_age is not None and cand_age is not None:
+                        over = abs(cand_age - seed_age) - 8
+                        if over > 0:
+                            if strict_artist and abs(cand_age - seed_age) > 20:
+                                _rej("era_distance")
+                                continue
+                            score -= min(400, int(30 * over))
                     if any(
                         _word_or_phrase_present(combined, x)
                         for x in OLD_ERA_ARTISTS
                     ):
                         score += 80
-                elif cand_age is not None and cand_age >= 15:
-                    score -= 100
+                    # Seed 2000s/90s ka hai to 60s-70s ke golden singers "aur old" na jayen.
+                    if (
+                        seed_age is not None
+                        and seed_age < 25
+                        and (artist or "") not in GOLDEN_ARTISTS
+                        and any(
+                            _word_or_phrase_present(combined, x)
+                            for x in GOLDEN_ARTISTS
+                        )
+                    ):
+                        score -= 200
+                else:
+                    if seed_age is not None and cand_age is not None:
+                        over = abs(cand_age - seed_age) - 3
+                        if over > 0:
+                            if strict_artist and abs(cand_age - seed_age) > 6:
+                                _rej("era_distance")
+                                continue
+                            score -= min(400, int(60 * over))
+                    elif cand_age is not None and cand_age >= 15:
+                        score -= 100
+                    # Topic/re-upload me age pata na ho tab bhi "purane daur" ke signals.
+                    if candidate_mood == "oldschool" or any(
+                        _word_or_phrase_present(combined, x)
+                        for x in GOLDEN_ARTISTS
+                    ):
+                        if strict_artist:
+                            _rej("old_style_for_newer_seed")
+                            continue
+                        score -= 250
 
                 same_artist = False
                 if artist:
@@ -1592,11 +1810,14 @@ async def auto_play_next(
 
         if in_chain:
             lang = previous_ctx.get("lang") or detect_lang(last_title)
-            artist = previous_ctx.get("artist") or extract_artist(last_title)
-            mood = previous_ctx.get("mood") or "normal"
+            # Singer/mood ab LAST PLAYED song se update hote hain; title se signal
+            # na mile to pichla context carry hota hai. Language strict (carry).
+            artist = extract_artist(last_title) or previous_ctx.get("artist") or ""
+            mood = detect_mood(last_title)
             if mood == "normal":
-                mood = detect_mood(last_title)
+                mood = previous_ctx.get("mood") or "normal"
             era = previous_ctx.get("era") or ""
+            seed_age = previous_ctx.get("seed_age")  # seed ka daur anchored
         else:
             # Manual/new seed song: title + YouTube metadata (ek hi search).
             rows = await fetch_track_meta(last_title, last_vidid)
@@ -1615,9 +1836,13 @@ async def auto_play_next(
             ty = _year_in_title(last_title)
             if (
                 mood == "oldschool"
-                or (artist or "") in OLD_ERA_ARTISTS
-                or (seed_age is not None and seed_age >= 10)
+                or (artist or "") in GOLDEN_ARTISTS
+                or (seed_age is not None and seed_age >= 12)
                 or (ty and ty <= 2012)
+                or (
+                    (artist or "") in NINETIES_ARTISTS
+                    and (seed_age is None or seed_age >= 8)
+                )
             ):
                 era = "old"
             elif seed_age is not None and seed_age < 4:
@@ -1627,7 +1852,7 @@ async def auto_play_next(
 
         print(
             f"🌐 Autoplay context: lang={lang} artist={artist or '-'} "
-            f"mood={mood} era={era or '-'} chain={in_chain} | current={last_title}"
+            f"mood={mood} era={era or '-'} seed_age={'%.1f' % seed_age if seed_age is not None else '-'} chain={in_chain} | current={last_title}"
         )
 
         movie = detect_movie(last_title)
@@ -1635,7 +1860,8 @@ async def auto_play_next(
             _remember_movie(chat_id, movie)
 
         queries = build_smart_queries(
-            last_title, artist, movie, lang, mood, chat_id=chat_id, era=era
+            last_title, artist, movie, lang, mood, chat_id=chat_id, era=era,
+            seed_age=seed_age,
         )
         search_started = time.monotonic()
 
@@ -1653,6 +1879,7 @@ async def auto_play_next(
             lang,
             limit=3,
             era=era,
+            seed_age=seed_age,
         )
 
         print(
@@ -1691,44 +1918,22 @@ async def auto_play_next(
                 limit=5,
                 era=era,
                 strict_artist=False,
+                seed_age=seed_age,
             )
 
         if not ranked:
-            # Stage 3: history/pool exhaust ho gaya ho sakta hai -> is chat ki
-            # history saaf karke (current song rakhke) dobara try.
+            # Stage 3: WIDER search. History kabhi clear nahi hoti (same session
+            # me repeat nahi) aur language strict rehti hai.
+            broad = build_broad_queries(chat_id, artist, lang, mood, era, seed_age)
             print(
                 f"⚠️ Autoplay [{chat_id}] fallback khali. rejects="
-                f"{LAST_REJECTS.get(chat_id)} -> purani history trim karke retry"
-            )
-            # Pehle sirf sabse purane songs hatao (haal ke 15 block rehte hain).
-            # Phir bhi khali ho to 5, aur aakhir me sirf current song block.
-            for keep in (AUTOPLAY_KEEP_ON_EXHAUST, 5, 0):
-                RECENT[chat_id] = RECENT.get(chat_id, [])[-keep:] if keep else []
-                RECENT_TITLES[chat_id] = (
-                    RECENT_TITLES.get(chat_id, [])[-keep:] if keep else []
-                )
-                if last_vidid:
-                    await add_recent(chat_id, last_vidid, last_title)
-                ranked = await get_ranked_songs(
-                    chat_id, fallback_queries + queries, last_title, last_vidid,
-                    artist, movie, mood, lang,
-                    limit=5, era=era, strict_artist=False,
-                )
-                if ranked:
-                    print(f"♻️ Autoplay [{chat_id}] history trim: sirf last {keep} block rakhe")
-                    break
-
-        if not ranked:
-            # Stage 4: aakhri koshish — language rule bhi naram (penalty), taaki
-            # "no relevant song" se VC band na ho.
-            print(
-                f"⚠️ Autoplay [{chat_id}] retry bhi khali. rejects="
-                f"{LAST_REJECTS.get(chat_id)} -> language relax"
+                f"{LAST_REJECTS.get(chat_id)} -> wider search "
+                f"({len(broad)} queries, repeat+language strict)"
             )
             ranked = await get_ranked_songs(
-                chat_id, fallback_queries + queries, last_title, last_vidid,
+                chat_id, broad + fallback_queries, last_title, last_vidid,
                 artist, movie, mood, lang,
-                limit=5, era=era, strict_artist=False, strict_lang=False,
+                limit=5, era=era, strict_artist=False, deep=True, seed_age=seed_age,
             )
 
         if not ranked:
@@ -1737,6 +1942,8 @@ async def auto_play_next(
             except Exception:
                 pass
             print(f"⛔ Autoplay False [{chat_id}]: search me koi candidate nahi bacha (lang={lang}, artist={artist or '-'}, mood={mood}, era={era or '-'}) rejects={LAST_REJECTS.get(chat_id)}")
+            if (LAST_REJECTS.get(chat_id) or {}).get("raw_results", 0) == 0:
+                print("❗ Search se ek bhi result nahi aaya -> py_yt/network/YouTube block check karo (upar ⚠️ Search failed lines dekho).")
             return False
 
         language = await get_lang(chat_id)
@@ -1767,7 +1974,8 @@ async def auto_play_next(
                 if not thumb or not thumb.startswith("http"):
                     thumb = await get_thumbnail_direct(vidid)
             except Exception:
-                thumb = await get_thumbnail_direct(vidid)
+                # Thumbnail kisi bhi wajah se fail ho to stream na ruke.
+                thumb = f"https://img.youtube.com/vi/{vidid}/hqdefault.jpg"
 
             try:
                 await stream(
@@ -1808,9 +2016,11 @@ async def auto_play_next(
                 )
                 _remember_artist(chat_id, played_artist)
 
-                # Anchor: seed ka artist/mood rakho; sirf seed me na ho to naya lo.
-                next_artist = artist or extract_artist(new_title) or ""
-                next_mood = mood if mood != "normal" else detect_mood(new_title)
+                # Context ab jo song abhi chuna uske hisaab se update hota hai.
+                next_artist = played_artist or artist or ""
+                next_mood = detect_mood(new_title)
+                if next_mood == "normal":
+                    next_mood = mood or "normal"
 
                 AUTOPLAY_CONTEXT[chat_id] = {
                     "vidid": vidid,
@@ -1818,6 +2028,7 @@ async def auto_play_next(
                     "artist": next_artist,
                     "mood": next_mood,
                     "era": era,
+                    "seed_age": seed_age,
                 }
 
                 last_stream_error = None
